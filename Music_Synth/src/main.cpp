@@ -6,6 +6,7 @@
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
 #include <unordered_map>
+#include <Wire.h>
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -47,11 +48,34 @@
   volatile uint32_t knob3Rotation = 5;
   volatile uint8_t TX_Message[8] = {0};
   volatile uint8_t octiave = 4;
+  volatile uint8_t pcalData = 0;
+
+  const uint8_t PCAL_ADDR = 0x21;
+  const int KNOB_INT_PIN = PA15;
 
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
 HardwareTimer sampleTimer(TIM1);
 SemaphoreHandle_t CAN_TX_Semaphore;
+SemaphoreHandle_t i2cMutex;
+SemaphoreHandle_t knobIntSem;
+
+
+enum EnvStage{OFF, ATTACK, DECAY, SUSTAIN, RELEASE};
+
+struct Voice{
+  bool active;
+  uint8_t note;
+  uint8_t octave;
+  uint32_t phase;
+  uint32_t step;
+  
+  EnvStage envStage;
+  float envLevel;
+  float sustainLevel;
+};
+
+volatile Voice voices[8];
 
 struct {
 std::bitset<32> inputs; 
@@ -100,10 +124,34 @@ std::bitset<4> readCols(){
 }
 
 void setRow(const uint8_t rowIdx){
+  if(rowIdx == 2){
+    digitalWrite(OUT_PIN, LOW);
+  }else{
+    digitalWrite(OUT_PIN, HIGH);
+  }
   digitalWrite(RA0_PIN, rowIdx & 0x01);
   digitalWrite(RA1_PIN, rowIdx & 0x02);
   digitalWrite(RA2_PIN, rowIdx & 0x04);
   digitalWrite(REN_PIN, HIGH);
+}
+
+void pcalWriteReg(uint8_t reg, uint8_t val){
+  Wire.beginTransmission(PCAL_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t pcalReadInputs(){
+  Wire.beginTransmission(PCAL_ADDR);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  Wire.requestFrom(PCAL_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+void knobIntISR(){
+  xSemaphoreGiveFromISR(knobIntSem, NULL);
 }
 
 void sampleISR(){
@@ -121,6 +169,7 @@ void CAN_RX_ISR (void) {
 	xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
+
 void CAN_TX_ISR (void) {
 	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
 }
@@ -128,7 +177,7 @@ void CAN_TX_ISR (void) {
 void scanKeysTask(void * pvParameters){
   static uint32_t next = millis();
   static uint32_t count = 0;
-  const TickType_t xFrequency = 20/portTICK_PERIOD_MS;
+  const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
   static std::bitset<32> inputs;
   static std::bitset<32> old_inputs;
   static std::bitset<2> knob3State;
@@ -169,27 +218,7 @@ void scanKeysTask(void * pvParameters){
         xQueueSend(msgOutQ, msg_ptr, portMAX_DELAY);
       }
     }
-
-    knob3State[0] = inputs[12];
-    knob3State[1] = inputs[13];
-
-    switch (knob3State.to_ulong()){
-      case 0b00:
-        if(old_knob3State == 0b01 && knob3Rotation > 0) knob3Rotation -= 1;
-        break;
-      case 0b01:
-        if(old_knob3State == 0b00 && knob3Rotation < 8) knob3Rotation += 1;
-        break;
-      case 0b10:
-        if(old_knob3State == 0b11 && knob3Rotation < 8) knob3Rotation += 1;
-        break;
-      case 0b11:
-        if(old_knob3State == 0b10 && knob3Rotation > 0) knob3Rotation -= 1;
-        break;
-    }
-    old_knob3State = knob3State;
     
-
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
 }
@@ -221,11 +250,35 @@ void displayKeysTask(void * pvParameters){
     u8g2.setCursor(50,30);
     volume_str = "Volume: " + std::to_string(knob3Rotation);
     u8g2.print(volume_str.c_str());
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
     u8g2.sendBuffer();          // transfer internal memory to the display
+    xSemaphoreGive(i2cMutex);
 
     //Toggle LED
     digitalToggle(LED_BUILTIN);
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
+  }
+}
+
+void knobTask(void * pvParameters){
+  uint8_t prev = 0xFF;
+  while(true){
+    xSemaphoreTake(knobIntSem, portMAX_DELAY);
+    Serial.println("Knob interrupt");
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    uint8_t now = pcalReadInputs();
+
+    xSemaphoreGive(i2cMutex);
+
+    // Observed transitions are on bits 6 and 7 for knob 3 A/B.
+    uint8_t prevAB = (prev >> 6) & 0x03;
+    uint8_t nowAB = (now >> 6) & 0x03;
+
+    uint8_t t = (prevAB << 2) | nowAB;
+    if ((t == 0b0001 || t == 0b1110) && knob3Rotation < 8) knob3Rotation++;
+    if ((t == 0b1011 || t == 0b0100) && knob3Rotation > 0) knob3Rotation--;
+
+    prev = now;
   }
 }
 
@@ -297,7 +350,7 @@ void setup() {
   setOutMuxBit(DRST_BIT, HIGH);  //Release display logic reset
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
-  setOutMuxBit(KNOB_MODE, HIGH);  //Read knobs through key matrix
+  setOutMuxBit(KNOB_MODE, LOW);  //Read knobs through key matrix
 
   setOutMuxBit(ALL_BITS, HIGH);  //Enable headphone output
   digitalWrite(REN_PIN, HIGH);
@@ -348,14 +401,25 @@ void setup() {
   1,			/* Task priority */
   &decodeHandle );	/* Pointer to store the task handle */
 
-  TaskHandle_t CANTXhandle = NULL;
-  xTaskCreate(
-  CAN_TX_Task,		/* Function that implements the task */
-  "CAN_TX",		/* Text name for the task */
-  64,      		/* Stack size in words, not bytes */
-  NULL,			/* Parameter passed into the task */
-  1,			/* Task priority */
-  &CANTXhandle );	/* Pointer to store the task handle */
+  TaskHandle_t CANTXHandle = NULL;
+  xTaskCreate(CAN_TX_Task,"CAN_TX",64,NULL,1,&CANTXHandle );	
+  TaskHandle_t knobHandle = NULL;
+  xTaskCreate(knobTask,"knob",64,NULL,1,&knobHandle );	
+
+  Wire.begin();
+  i2cMutex = xSemaphoreCreateMutex();
+  knobIntSem = xSemaphoreCreateBinary();
+
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  pcalWriteReg(0x03, 0xFF); // Configuration: all pins input
+  pcalWriteReg(0x43, 0xFF); // Pull-up/down enable
+  pcalWriteReg(0x44, 0xFF); // Pull-up select
+  pcalWriteReg(0x42, 0xFF); // Input latch enable (all pins)
+  pcalWriteReg(0x45, 0x00); // Interrupt mask: enable only bits 6/7 (knob3 A/B)
+  (void)pcalReadInputs();   // Clear pending input-change state
+  xSemaphoreGive(i2cMutex);
+  pinMode(KNOB_INT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(KNOB_INT_PIN), knobIntISR, LOW);
 
   CAN_Init(true);
   setCANFilter(0x123,0x7ff);
