@@ -51,7 +51,7 @@
   volatile uint8_t pcalData = 0;
 
   const uint8_t PCAL_ADDR = 0x21;
-  const int KNOB_INT_PIN = PA15;
+  const int KNOB_INT_PIN = PA10;
 
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
@@ -124,6 +124,7 @@ std::bitset<4> readCols(){
 }
 
 void setRow(const uint8_t rowIdx){
+  digitalWrite(REN_PIN, LOW);
   if(rowIdx == 2){
     digitalWrite(OUT_PIN, LOW);
   }else{
