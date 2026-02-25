@@ -6,9 +6,13 @@
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
 #include <unordered_map>
+#include <cmath>
+
+enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
 
 //Constants
   const uint32_t interval = 100; //Display update interval
+  const uint32_t sampling_frequency = 22000;
 
 //Pin definitions
   //Row select and enable
@@ -42,11 +46,26 @@
 
   uint32_t ID = 0x123;
   uint32_t stepSizes[12];
+  double frequencies[12];
+  int32_t sineLUT[4096];
   
   volatile uint32_t currentStepSize = 0;
-  volatile uint32_t knob3Rotation = 5;
+  volatile uint8_t knob3Rotation = 8;
+  volatile uint8_t knob2Rotation = 0;
+  volatile uint8_t knob1Rotation = 4;
   volatile uint8_t TX_Message[8] = {0};
-  volatile uint8_t octiave = 4;
+  volatile uint8_t octave = 4;
+  volatile waveform_t currentWaveform = SAWTOOTH;
+
+struct Voice{
+uint8_t octave;
+uint8_t key;
+uint32_t phase;
+uint32_t step;
+uint32_t value;
+bool active;
+};
+volatile Voice voices[8];
 
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
@@ -55,7 +74,6 @@ SemaphoreHandle_t CAN_TX_Semaphore;
 
 struct {
 std::bitset<32> inputs; 
-std::bitset<88> key_states;
 uint8_t RX_Message[8] = {0};
 SemaphoreHandle_t mutex;
 } sysState;
@@ -106,12 +124,49 @@ void setRow(const uint8_t rowIdx){
   digitalWrite(REN_PIN, HIGH);
 }
 
+std::string wave2String(const waveform_t wave){
+  if (wave == SINE){
+    return "SINE";
+  }else if(wave == SAWTOOTH){
+    return "SAWTOOTH";
+  }else if(wave == SQUARE){
+    return "SQUARE";
+  }else if(wave == TRIANGLE){
+    return "TRIANGLE";
+  }
+}
+
 void sampleISR(){
-  static uint32_t phaseAcc = 0;
-  phaseAcc += currentStepSize;
-  int32_t Vout = (phaseAcc >> 24) - 128;
-  Vout = Vout >> (8-knob3Rotation); //Apply volume control
-  analogWrite(OUTR_PIN, Vout + 128);
+  static int32_t phaseAcc = 0;
+  phaseAcc = 0;
+  uint8_t count = 0;
+
+  if(currentWaveform == SINE){
+    for(int i = 0; i<8; i++){
+      if(voices[i].active){
+        int32_t sample = sineLUT[voices[i].phase >> 20];
+        phaseAcc += sample >> (8-knob3Rotation);
+        voices[i].phase += voices[i].step;
+        count++;
+      }
+    }
+  }else if(currentWaveform == SAWTOOTH){
+    for(int i = 0; i<8; i++){
+      if(voices[i].active){
+        int32_t sample = voices[i].phase-(1<<31);
+        phaseAcc += sample >> (3+(8-knob3Rotation));
+        voices[i].phase += voices[i].step;
+        count++;
+      }
+    }
+  }
+
+  if(count != 0){  
+    int32_t Vout = (phaseAcc >> 20);
+    //Vout = Vout >> (8-knob3Rotation); //Apply volume control
+    analogWrite(OUTR_PIN, Vout + 2048);
+  }
+
 }
 
 void CAN_RX_ISR (void) {
@@ -131,8 +186,12 @@ void scanKeysTask(void * pvParameters){
   const TickType_t xFrequency = 20/portTICK_PERIOD_MS;
   static std::bitset<32> inputs;
   static std::bitset<32> old_inputs;
+  static std::bitset<2> knob2State;
   static std::bitset<2> knob3State;
+  static std::bitset<2> knob1State;
+  static std::bitset<2> old_knob2State;
   static std::bitset<2> old_knob3State;
+  static std::bitset<2> old_knob1State;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   
   while(true){
@@ -156,13 +215,13 @@ void scanKeysTask(void * pvParameters){
           Serial.print("Pushed: ");
           Serial.println(i);
           TX_Message[0] = 'P';
-          TX_Message[1] = octiave;
+          TX_Message[1] = octave;
           TX_Message[2] = i;
         }else{
           Serial.print("Released: ");
           Serial.println(i);
           TX_Message[0] = 'R';
-          TX_Message[1] = octiave;
+          TX_Message[1] = octave;
           TX_Message[2] = i;
         }
         uint8_t* msg_ptr = (uint8_t*) TX_Message;
@@ -188,7 +247,57 @@ void scanKeysTask(void * pvParameters){
         break;
     }
     old_knob3State = knob3State;
-    
+
+    knob2State[0] = inputs[14];
+    knob2State[1] = inputs[15];
+
+    switch (knob2State.to_ulong()){
+      case 0b00:
+        if(old_knob2State == 0b01 && knob2Rotation > 0) knob2Rotation -= 1;
+        else if(old_knob2State == 0b01 && knob2Rotation <= 0) knob2Rotation = 3;
+        break;
+      case 0b01:
+        if(old_knob2State == 0b00 && knob2Rotation < 3) knob2Rotation += 1;
+        else if(old_knob2State == 0b00 && knob2Rotation >= 3) knob2Rotation = 0;
+        break;
+      case 0b10:
+        if(old_knob2State == 0b11 && knob2Rotation < 3) knob2Rotation += 1;
+        else if(old_knob2State == 0b11 && knob2Rotation >= 3) knob2Rotation = 0;
+        break;
+      case 0b11:
+        if(old_knob2State == 0b10 && knob2Rotation > 0) knob2Rotation -= 1;
+        else if(old_knob2State == 0b10 && knob2Rotation <= 0) knob2Rotation = 3;
+        break;
+    }
+    old_knob2State = knob2State;
+
+    switch (knob2Rotation) {
+      case 0: currentWaveform = SAWTOOTH; break;
+      case 1: currentWaveform = SINE;     break;
+      case 2: currentWaveform = SQUARE;   break;
+      case 3: currentWaveform = TRIANGLE; break;
+    }
+
+    knob1State[0] = inputs[16];
+    knob1State[1] = inputs[17];
+
+    switch (knob1State.to_ulong()){
+      case 0b00:
+        if(old_knob1State == 0b01 && knob1Rotation > 0) knob1Rotation -= 1;
+        break;
+      case 0b01:
+        if(old_knob1State == 0b00 && knob1Rotation < 8) knob1Rotation += 1;
+        break;
+      case 0b10:
+        if(old_knob1State == 0b11 && knob1Rotation < 8) knob1Rotation += 1;
+        break;
+      case 0b11:
+        if(old_knob1State == 0b10 && knob1Rotation > 0) knob1Rotation -= 1;
+        break;
+    }
+    old_knob1State = knob1State;
+    octave = knob1Rotation;
+
 
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
@@ -203,9 +312,13 @@ void displayKeysTask(void * pvParameters){
     u8g2.setCursor(2,10);
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     u8g2.print((char) sysState.RX_Message[0]);
+    u8g2.print(sysState.RX_Message[1]);
+    u8g2.print(sysState.RX_Message[2]);
     xSemaphoreGive(sysState.mutex);
-    u8g2.print(TX_Message[1]);
-    u8g2.print(TX_Message[2]);
+
+    u8g2.setCursor(50,10);
+    u8g2.print(wave2String(currentWaveform).c_str());
+
     u8g2.setCursor(2,20);
     std::string key_states = "";
     std::string volume_str;
@@ -216,8 +329,11 @@ void displayKeysTask(void * pvParameters){
     }
     xSemaphoreGive(sysState.mutex);
     u8g2.print(key_states.c_str());
+
     u8g2.setCursor(2,30);
-    u8g2.print(currentStepSize);
+    u8g2.print("Oct: ");
+    u8g2.print(octave);
+
     u8g2.setCursor(50,30);
     volume_str = "Volume: " + std::to_string(knob3Rotation);
     u8g2.print(volume_str.c_str());
@@ -241,20 +357,29 @@ void decodeTask(void * pvParameters){
     sysState.RX_Message[1] = octave;
     sysState.RX_Message[2] = key;
     if(command == 'P'){
-      sysState.key_states[octave*12 + key] = 1;
+      for(int i = 0; i<8; i++){
+        if(voices[i].active){
+          continue;
+        }else{
+          voices[i].octave = octave;
+          voices[i].key = key;
+          voices[i].phase = 0;
+          voices[i].step = static_cast<uint32_t>(
+            (static_cast<double>(frequencies[key]) *
+             pow(2.0, static_cast<double>(static_cast<int>(octave) - 4)) *
+             4294967296.0) / sampling_frequency
+          );
+          voices[i].active = true;
+          break;
+        }
+    }
     }else if(command == 'R'){
-      sysState.key_states[octave*12 + key] = 0;
-    }
-    bool anyKeyPressed = false;
-    for(int i = 0; i<88; i++){
-      if(sysState.key_states[i]){
-        currentStepSize = stepSizes[i%12] >> (octave - 4);
-        anyKeyPressed = true;
-        break;
+      for(int i = 0; i<8; i++){
+        if(voices[i].active && voices[i].octave == octave && voices[i].key == key){
+          voices[i].active = false;
+          break;
+        }
       }
-    }
-    if(!anyKeyPressed){
-      currentStepSize = 0;
     }
     xSemaphoreGive(sysState.mutex);
   }
@@ -273,6 +398,10 @@ void CAN_TX_Task(void * pvParameters){
 
 void setup() {
   // put your setup code here, to run once:
+  analogWriteResolution(12);
+  msgInQ = xQueueCreate(36,8);
+  msgOutQ = xQueueCreate(36,8);
+  sysState.mutex = xSemaphoreCreateMutex();
 
   //Set pin directions
   pinMode(RA0_PIN, OUTPUT);
@@ -304,19 +433,31 @@ void setup() {
   
   //Initialise UART
   Serial.begin(9600);
-  // NCO tuning: A (index 9) = 440 Hz, fs = 22 kHz
-  constexpr double sampleRate = 22000.0;
-  constexpr double semitone = 1.0594630943592953; // 2^(1/12)
-  constexpr double ncoScale = 4294967296.0 / sampleRate; // 2^32 / fs
-  double freq = 440.0 * pow(semitone, -9.0); // index 0 is C
-  for (int i = 0; i < 12; i++) {
-    stepSizes[i] = static_cast<uint32_t>(freq * ncoScale);
-    freq *= semitone;
+  Serial.println("Serial initialized");
+
+  for (int i = 0; i < 4096; i++) {
+    double phase = (2.0 * PI * static_cast<double>(i)) / 4096;
+    double s = sin(phase);
+    double value = 2147483647.0 * s;
+    sineLUT[i] = static_cast<int32_t>(value);
   }
 
-  sysState.key_states = 0;
+  // NCO tuning: A (index 9) = 440 Hz, fs = 22 kHz
+  // constexpr double sampleRate = 22000.0;
+  // constexpr double semitone = 1.0594630943592953; // 2^(1/12)
+  // constexpr double ncoScale = 4294967296.0 / sampleRate; // 2^32 / fs
+  // double freq = 440.0 * pow(semitone, -9.0); // index 0 is C
+  // for (int i = 0; i < 12; i++) {
+  //   stepSizes[i] = static_cast<uint32_t>(freq * ncoScale);
+  //   freq *= semitone;
+  // }
 
-  sampleTimer.setOverflow(22000, HERTZ_FORMAT);
+  constexpr double c4Hz = 261.6255653005986; // Middle C (C4)
+  for (int i = 0; i < 12; i++) {
+    frequencies[i] = c4Hz * pow(2.0, static_cast<double>(i) / 12.0);
+  }
+
+  sampleTimer.setOverflow(sampling_frequency, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3,3);
@@ -363,12 +504,11 @@ void setup() {
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
 
-  msgInQ = xQueueCreate(36,8);
-  msgOutQ = xQueueCreate(36,8);
-  sysState.mutex = xSemaphoreCreateMutex();
+
   vTaskStartScheduler();
 }
 
 void loop() {
+
   // put your main code here, to run repeatedly:
 }
