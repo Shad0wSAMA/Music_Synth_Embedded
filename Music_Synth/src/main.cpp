@@ -101,8 +101,8 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(RA0_PIN, bitIdx & 0x01);
       digitalWrite(RA1_PIN, bitIdx & 0x02);
       digitalWrite(RA2_PIN, bitIdx & 0x04);
-      digitalWrite(OUT_PIN,value);
-      digitalWrite(REN_PIN,HIGH);
+      digitalWrite(OUT_PIN, value);
+      digitalWrite(REN_PIN, HIGH);
       delayMicroseconds(2);
       digitalWrite(REN_PIN,LOW);
 }
@@ -257,6 +257,10 @@ void scanKeysTask(void * pvParameters){
     }
     sysState.inputs = inputs;
     xSemaphoreGive(sysState.mutex);
+    for(int i = 0; i<12; i++){
+      Serial.print(inputs[i]);
+    }
+    Serial.println();
     
     std::bitset<32> changed = inputs ^ old_inputs;
 
@@ -290,27 +294,29 @@ void scanKeysTask(void * pvParameters){
     }
     octave = knob1Rotation;
 
-    for(int i = 0; i<12; i++){
-      if(changed[i]){
-        if(!inputs[i]){
-          Serial.print("Pushed: ");
-          Serial.println(i);
-          TX_Message[0] = 'P';
-          TX_Message[1] = octave;
-          TX_Message[2] = i;
-          applyKeyEvent('P', octave, i);
-        }else{
-          Serial.print("Released: ");
-          Serial.println(i);
-          TX_Message[0] = 'R';
-          TX_Message[1] = octave;
-          TX_Message[2] = i;
-          applyKeyEvent('R', octave, i);
-        }
-        uint8_t* msg_ptr = (uint8_t*) TX_Message;
-        xQueueSend(msgOutQ, msg_ptr, 0);
-      }
-    }
+    // if(!changed.none()){
+    //   for(int i = 0; i<12; i++){
+    //     if(changed[i]){
+    //       if(!inputs[i]){
+    //         Serial.print("Pushed: ");
+    //         Serial.println(i);
+    //         TX_Message[0] = 'P';
+    //         TX_Message[1] = octave;
+    //         TX_Message[2] = i;
+    //         applyKeyEvent('P', octave, i);
+    //       }else{
+    //         Serial.print("Released: ");
+    //         Serial.println(i);
+    //         TX_Message[0] = 'R';
+    //         TX_Message[1] = octave;
+    //         TX_Message[2] = i;
+    //         applyKeyEvent('R', octave, i);
+    //       }
+    //       uint8_t* msg_ptr = (uint8_t*) TX_Message;
+    //       xQueueSend(msgOutQ, msg_ptr, 0);
+    //     }
+    //   }
+    // }
 
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
