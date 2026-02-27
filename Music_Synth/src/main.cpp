@@ -229,7 +229,7 @@ void CAN_RX_ISR (void) {
 	uint8_t RX_Message_ISR[8];
 	uint32_t ID;
 	CAN_RX(ID, RX_Message_ISR);
-	xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+	Serial.println(xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL));
 }
 
 
@@ -310,7 +310,7 @@ void scanKeysTask(void * pvParameters){
             applyKeyEvent('R', octave, i);
           }
           uint8_t* msg_ptr = (uint8_t*) TX_Message;
-          xQueueSend(msgOutQ, msg_ptr, 0);
+          Serial.println(xQueueSend(msgOutQ, msg_ptr, 0));
         }
       }
     }
