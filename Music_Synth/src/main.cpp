@@ -290,6 +290,7 @@ void scanKeysTask(void * pvParameters){
     old_inputs = sysState.inputs;
     for(int i = 0; i<8; i++){
       setRow(i);
+      delayMicroseconds(5);
       std::bitset<4> col = readCols();
       for(int j = 0; j<4; j++){
         inputs[i*4+j] = col[j];
@@ -418,7 +419,7 @@ void knobTask(void * pvParameters){
 void decodeTask(void * pvParameters){
   uint8_t RX_Message[8] = {0};
   while(true){
-    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+    xQueueReceive(msgInQ, RX_Message, 0);
     uint8_t command = RX_Message[0];
     uint8_t octave = RX_Message[1];
     uint8_t key = RX_Message[2];
@@ -429,7 +430,7 @@ void decodeTask(void * pvParameters){
 void CAN_TX_Task(void * pvParameters){
 	uint8_t msgOut[8];
 	while (true) {
-		xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+		xQueueReceive(msgOutQ, msgOut, 0);
 		xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
 		CAN_TX(0x123, msgOut);
 	}
