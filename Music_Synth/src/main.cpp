@@ -250,6 +250,7 @@ void scanKeysTask(void * pvParameters){
     old_inputs = sysState.inputs;
     for(int i = 0; i<8; i++){
       setRow(i);
+      delayMicroseconds(10);
       std::bitset<4> col = readCols();
       for(int j = 0; j<4; j++){
         inputs[i*4+j] = col[j];
@@ -257,10 +258,6 @@ void scanKeysTask(void * pvParameters){
     }
     sysState.inputs = inputs;
     xSemaphoreGive(sysState.mutex);
-    for(int i = 0; i<12; i++){
-      Serial.print(inputs[i]);
-    }
-    Serial.println();
     
     std::bitset<32> changed = inputs ^ old_inputs;
 
@@ -294,29 +291,29 @@ void scanKeysTask(void * pvParameters){
     }
     octave = knob1Rotation;
 
-    // if(!changed.none()){
-    //   for(int i = 0; i<12; i++){
-    //     if(changed[i]){
-    //       if(!inputs[i]){
-    //         Serial.print("Pushed: ");
-    //         Serial.println(i);
-    //         TX_Message[0] = 'P';
-    //         TX_Message[1] = octave;
-    //         TX_Message[2] = i;
-    //         applyKeyEvent('P', octave, i);
-    //       }else{
-    //         Serial.print("Released: ");
-    //         Serial.println(i);
-    //         TX_Message[0] = 'R';
-    //         TX_Message[1] = octave;
-    //         TX_Message[2] = i;
-    //         applyKeyEvent('R', octave, i);
-    //       }
-    //       uint8_t* msg_ptr = (uint8_t*) TX_Message;
-    //       xQueueSend(msgOutQ, msg_ptr, 0);
-    //     }
-    //   }
-    // }
+    if(!changed.none()){
+      for(int i = 0; i<12; i++){
+        if(changed[i]){
+          if(!inputs[i]){
+            Serial.print("Pushed: ");
+            Serial.println(i);
+            TX_Message[0] = 'P';
+            TX_Message[1] = octave;
+            TX_Message[2] = i;
+            applyKeyEvent('P', octave, i);
+          }else{
+            Serial.print("Released: ");
+            Serial.println(i);
+            TX_Message[0] = 'R';
+            TX_Message[1] = octave;
+            TX_Message[2] = i;
+            applyKeyEvent('R', octave, i);
+          }
+          uint8_t* msg_ptr = (uint8_t*) TX_Message;
+          xQueueSend(msgOutQ, msg_ptr, 0);
+        }
+      }
+    }
 
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
