@@ -229,11 +229,14 @@ void CAN_RX_ISR (void) {
 	uint8_t RX_Message_ISR[8];
 	uint32_t ID;
 	CAN_RX(ID, RX_Message_ISR);
-	Serial.println(xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL));
+	// Serial.print("Can Receiving: "); 
+  // Serial.println();
+  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
 
 void CAN_TX_ISR (void) {
+  Serial.println("CAN_TX");
 	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
 }
 
@@ -310,7 +313,6 @@ void scanKeysTask(void * pvParameters){
             applyKeyEvent('R', octave, i);
           }
           uint8_t* msg_ptr = (uint8_t*) TX_Message;
-          Serial.println(xQueueSend(msgOutQ, msg_ptr, 0));
         }
       }
     }
@@ -377,6 +379,7 @@ void CAN_TX_Task(void * pvParameters){
 	while (true) {
 		xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
 		xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+    Serial.println("Received CAN_TX");
 		CAN_TX(0x123, msgOut);
 	}
 }
