@@ -14,6 +14,7 @@ enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
 //Constants
   const uint32_t interval = 100; //Display update interval
   const uint32_t sampling_frequency = 22000;
+  constexpr uint8_t kNumVoices = 4;
 
 //Pin definitions
   //Row select and enable
@@ -28,6 +29,7 @@ enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
   const int C2_PIN = A6;
   const int C3_PIN = D1;
   const int OUT_PIN = D11;
+  const int KNOB_INT_PIN = PA10;
 
   //Audio analogue out
   const int OUTL_PIN = A4;
@@ -66,7 +68,6 @@ uint32_t step;
 uint32_t value;
 bool active;
 };
-volatile Voice voices[8];
 
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
@@ -75,22 +76,7 @@ SemaphoreHandle_t CAN_TX_Semaphore;
 SemaphoreHandle_t i2cMutex;
 SemaphoreHandle_t knobIntSem;
 
-
-enum EnvStage{OFF, ATTACK, DECAY, SUSTAIN, RELEASE};
-
-struct Voice{
-  bool active;
-  uint8_t note;
-  uint8_t octave;
-  uint32_t phase;
-  uint32_t step;
-  
-  EnvStage envStage;
-  float envLevel;
-  float sustainLevel;
-};
-
-volatile Voice voices[8];
+volatile Voice voices[kNumVoices];
 
 struct {
 std::bitset<32> inputs; 
@@ -112,6 +98,35 @@ const char * const INPUT_MAP[32] = {
   "Knob 0 S",     "Knob 1 S",     "Unused",       "East Detect",
   "Unused",       "Unused",       "Unused",       "Unused"
 };
+
+uint8_t pcalReadInputs() {
+  constexpr uint8_t kPcalAddr = 0x21;
+  constexpr uint8_t kInputReg = 0x00;
+
+  Wire.beginTransmission(kPcalAddr);
+  Wire.write(kInputReg);
+  if (Wire.endTransmission(false) != 0) {
+    return 0xFF;
+  }
+
+  if (Wire.requestFrom(kPcalAddr, static_cast<uint8_t>(1)) != 1) {
+    return 0xFF;
+  }
+
+  return Wire.read();
+}
+
+void pcalWriteReg(const uint8_t reg, const uint8_t value) {
+  constexpr uint8_t kPcalAddr = 0x21;
+  Wire.beginTransmission(kPcalAddr);
+  Wire.write(reg);
+  Wire.write(value);
+  (void)Wire.endTransmission();
+}
+
+void knobIntISR() {
+  xSemaphoreGiveFromISR(knobIntSem, NULL);
+}
 
 
 
@@ -160,6 +175,41 @@ std::string wave2String(const waveform_t wave){
   }else if(wave == TRIANGLE){
     return "TRIANGLE";
   }
+  return "UNKNOWN";
+}
+
+void applyKeyEvent(const uint8_t command, const uint8_t octaveValue, const uint8_t key){
+  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+  sysState.RX_Message[0] = command;
+  sysState.RX_Message[1] = octaveValue;
+  sysState.RX_Message[2] = key;
+
+  if(command == 'P'){
+    for(int i = 0; i<kNumVoices; i++){
+      if(voices[i].active){
+        continue;
+      }else{
+        voices[i].octave = octaveValue;
+        voices[i].key = key;
+        voices[i].phase = 0;
+        voices[i].step = static_cast<uint32_t>(
+          (static_cast<double>(frequencies[key]) *
+           pow(2.0, static_cast<double>(static_cast<int>(octaveValue) - 4)) *
+           4294967296.0) / sampling_frequency
+        );
+        voices[i].active = true;
+        break;
+      }
+    }
+  }else if(command == 'R'){
+    for(int i = 0; i<kNumVoices; i++){
+      if(voices[i].active && voices[i].octave == octaveValue && voices[i].key == key){
+        voices[i].active = false;
+        break;
+      }
+    }
+  }
+  xSemaphoreGive(sysState.mutex);
 }
 
 void sampleISR(){
@@ -168,7 +218,7 @@ void sampleISR(){
   uint8_t count = 0;
 
   if(currentWaveform == SINE){
-    for(int i = 0; i<8; i++){
+    for(int i = 0; i<kNumVoices; i++){
       if(voices[i].active){
         int32_t sample = sineLUT[voices[i].phase >> 20];
         phaseAcc += sample >> (8-knob3Rotation);
@@ -177,10 +227,30 @@ void sampleISR(){
       }
     }
   }else if(currentWaveform == SAWTOOTH){
-    for(int i = 0; i<8; i++){
+    for(int i = 0; i<kNumVoices; i++){
       if(voices[i].active){
-        int32_t sample = voices[i].phase-(1<<31);
-        phaseAcc += sample >> (3+(8-knob3Rotation));
+        int32_t sample = static_cast<int32_t>(voices[i].phase - 0x80000000u);
+        phaseAcc += sample >> (2+(8-knob3Rotation));
+        voices[i].phase += voices[i].step;
+        count++;
+      }
+    }
+  }else if(currentWaveform == SQUARE){
+    for(int i = 0; i<kNumVoices; i++){
+      if(voices[i].active){
+        int32_t sample = (voices[i].phase & 0x80000000u) ? 2147483647 : -2147483647;
+        phaseAcc += sample >> (2+(8-knob3Rotation));
+        voices[i].phase += voices[i].step;
+        count++;
+      }
+    }
+  }else if(currentWaveform == TRIANGLE){
+    for(int i = 0; i<kNumVoices; i++){
+      if(voices[i].active){
+        uint32_t ramp = voices[i].phase >> 15; // 17-bit ramp [0..131071]
+        uint32_t tri = (ramp & 0x10000u) ? (0x1FFFFu - ramp) : ramp; // Fold into triangle
+        int32_t sample = (static_cast<int32_t>(tri) << 16) - 2147483647;
+        phaseAcc += sample >> (2+(8-knob3Rotation));
         voices[i].phase += voices[i].step;
         count++;
       }
@@ -213,12 +283,6 @@ void scanKeysTask(void * pvParameters){
   const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
   static std::bitset<32> inputs;
   static std::bitset<32> old_inputs;
-  static std::bitset<2> knob2State;
-  static std::bitset<2> knob3State;
-  static std::bitset<2> knob1State;
-  static std::bitset<2> old_knob2State;
-  static std::bitset<2> old_knob3State;
-  static std::bitset<2> old_knob1State;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   
   while(true){
@@ -244,87 +308,19 @@ void scanKeysTask(void * pvParameters){
           TX_Message[0] = 'P';
           TX_Message[1] = octave;
           TX_Message[2] = i;
+          applyKeyEvent('P', octave, i);
         }else{
           Serial.print("Released: ");
           Serial.println(i);
           TX_Message[0] = 'R';
           TX_Message[1] = octave;
           TX_Message[2] = i;
+          applyKeyEvent('R', octave, i);
         }
         uint8_t* msg_ptr = (uint8_t*) TX_Message;
-        xQueueSend(msgOutQ, msg_ptr, portMAX_DELAY);
+        xQueueSend(msgOutQ, msg_ptr, 0);
       }
     }
-
-    knob3State[0] = inputs[12];
-    knob3State[1] = inputs[13];
-
-    switch (knob3State.to_ulong()){
-      case 0b00:
-        if(old_knob3State == 0b01 && knob3Rotation > 0) knob3Rotation -= 1;
-        break;
-      case 0b01:
-        if(old_knob3State == 0b00 && knob3Rotation < 8) knob3Rotation += 1;
-        break;
-      case 0b10:
-        if(old_knob3State == 0b11 && knob3Rotation < 8) knob3Rotation += 1;
-        break;
-      case 0b11:
-        if(old_knob3State == 0b10 && knob3Rotation > 0) knob3Rotation -= 1;
-        break;
-    }
-    old_knob3State = knob3State;
-
-    knob2State[0] = inputs[14];
-    knob2State[1] = inputs[15];
-
-    switch (knob2State.to_ulong()){
-      case 0b00:
-        if(old_knob2State == 0b01 && knob2Rotation > 0) knob2Rotation -= 1;
-        else if(old_knob2State == 0b01 && knob2Rotation <= 0) knob2Rotation = 3;
-        break;
-      case 0b01:
-        if(old_knob2State == 0b00 && knob2Rotation < 3) knob2Rotation += 1;
-        else if(old_knob2State == 0b00 && knob2Rotation >= 3) knob2Rotation = 0;
-        break;
-      case 0b10:
-        if(old_knob2State == 0b11 && knob2Rotation < 3) knob2Rotation += 1;
-        else if(old_knob2State == 0b11 && knob2Rotation >= 3) knob2Rotation = 0;
-        break;
-      case 0b11:
-        if(old_knob2State == 0b10 && knob2Rotation > 0) knob2Rotation -= 1;
-        else if(old_knob2State == 0b10 && knob2Rotation <= 0) knob2Rotation = 3;
-        break;
-    }
-    old_knob2State = knob2State;
-
-    switch (knob2Rotation) {
-      case 0: currentWaveform = SAWTOOTH; break;
-      case 1: currentWaveform = SINE;     break;
-      case 2: currentWaveform = SQUARE;   break;
-      case 3: currentWaveform = TRIANGLE; break;
-    }
-
-    knob1State[0] = inputs[16];
-    knob1State[1] = inputs[17];
-
-    switch (knob1State.to_ulong()){
-      case 0b00:
-        if(old_knob1State == 0b01 && knob1Rotation > 0) knob1Rotation -= 1;
-        break;
-      case 0b01:
-        if(old_knob1State == 0b00 && knob1Rotation < 8) knob1Rotation += 1;
-        break;
-      case 0b10:
-        if(old_knob1State == 0b11 && knob1Rotation < 8) knob1Rotation += 1;
-        break;
-      case 0b11:
-        if(old_knob1State == 0b10 && knob1Rotation > 0) knob1Rotation -= 1;
-        break;
-    }
-    old_knob1State = knob1State;
-    octave = knob1Rotation;
-
 
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
@@ -378,19 +374,42 @@ void knobTask(void * pvParameters){
   uint8_t prev = 0xFF;
   while(true){
     xSemaphoreTake(knobIntSem, portMAX_DELAY);
-    Serial.println("Knob interrupt");
     xSemaphoreTake(i2cMutex, portMAX_DELAY);
     uint8_t now = pcalReadInputs();
 
     xSemaphoreGive(i2cMutex);
 
-    // Observed transitions are on bits 6 and 7 for knob 3 A/B.
-    uint8_t prevAB = (prev >> 6) & 0x03;
-    uint8_t nowAB = (now >> 6) & 0x03;
+    // Quadrature decode from PCAL inputs:
+    // knob3 A/B: bits 6/7, knob2 A/B: bits 4/5, knob1 A/B: bits 2/3.
+    uint8_t prevAB3 = (prev >> 6) & 0x03;
+    uint8_t nowAB3 = (now >> 6) & 0x03;
+    uint8_t t3 = (prevAB3 << 2) | nowAB3;
+    if ((t3 == 0b0001 || t3 == 0b1110) && knob3Rotation < 8) knob3Rotation++;
+    if ((t3 == 0b1011 || t3 == 0b0100) && knob3Rotation > 0) knob3Rotation--;
 
-    uint8_t t = (prevAB << 2) | nowAB;
-    if ((t == 0b0001 || t == 0b1110) && knob3Rotation < 8) knob3Rotation++;
-    if ((t == 0b1011 || t == 0b0100) && knob3Rotation > 0) knob3Rotation--;
+    uint8_t prevAB2 = (prev >> 4) & 0x03;
+    uint8_t nowAB2 = (now >> 4) & 0x03;
+    uint8_t t2 = (prevAB2 << 2) | nowAB2;
+    if (t2 == 0b0001 || t2 == 0b1110) {
+      knob2Rotation = (knob2Rotation < 3) ? (knob2Rotation + 1) : 0;
+    }
+    if (t2 == 0b1011 || t2 == 0b0100) {
+      knob2Rotation = (knob2Rotation > 0) ? (knob2Rotation - 1) : 3;
+    }
+
+    uint8_t prevAB1 = (prev >> 2) & 0x03;
+    uint8_t nowAB1 = (now >> 2) & 0x03;
+    uint8_t t1 = (prevAB1 << 2) | nowAB1;
+    if ((t1 == 0b0001 || t1 == 0b1110) && knob1Rotation < 8) knob1Rotation++;
+    if ((t1 == 0b1011 || t1 == 0b0100) && knob1Rotation > 0) knob1Rotation--;
+
+    switch (knob2Rotation) {
+      case 0: currentWaveform = SAWTOOTH; break;
+      case 1: currentWaveform = SINE;     break;
+      case 2: currentWaveform = SQUARE;   break;
+      case 3: currentWaveform = TRIANGLE; break;
+    }
+    octave = knob1Rotation;
 
     prev = now;
   }
@@ -403,36 +422,7 @@ void decodeTask(void * pvParameters){
     uint8_t command = RX_Message[0];
     uint8_t octave = RX_Message[1];
     uint8_t key = RX_Message[2];
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    sysState.RX_Message[0] = command;
-    sysState.RX_Message[1] = octave;
-    sysState.RX_Message[2] = key;
-    if(command == 'P'){
-      for(int i = 0; i<8; i++){
-        if(voices[i].active){
-          continue;
-        }else{
-          voices[i].octave = octave;
-          voices[i].key = key;
-          voices[i].phase = 0;
-          voices[i].step = static_cast<uint32_t>(
-            (static_cast<double>(frequencies[key]) *
-             pow(2.0, static_cast<double>(static_cast<int>(octave) - 4)) *
-             4294967296.0) / sampling_frequency
-          );
-          voices[i].active = true;
-          break;
-        }
-    }
-    }else if(command == 'R'){
-      for(int i = 0; i<8; i++){
-        if(voices[i].active && voices[i].octave == octave && voices[i].key == key){
-          voices[i].active = false;
-          break;
-        }
-      }
-    }
-    xSemaphoreGive(sysState.mutex);
+    applyKeyEvent(command, octave, key);
   }
 }
 
@@ -554,13 +544,13 @@ void setup() {
   pcalWriteReg(0x43, 0xFF); // Pull-up/down enable
   pcalWriteReg(0x44, 0xFF); // Pull-up select
   pcalWriteReg(0x42, 0xFF); // Input latch enable (all pins)
-  pcalWriteReg(0x45, 0x00); // Interrupt mask: enable only bits 6/7 (knob3 A/B)
+  pcalWriteReg(0x45, 0x00); // Interrupt mask: enable all input interrupts
   (void)pcalReadInputs();   // Clear pending input-change state
   xSemaphoreGive(i2cMutex);
   pinMode(KNOB_INT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(KNOB_INT_PIN), knobIntISR, LOW);
 
-  CAN_Init(true);
+  CAN_Init(false);
   setCANFilter(0x123,0x7ff);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
   CAN_RegisterTX_ISR(CAN_TX_ISR);
