@@ -23,7 +23,7 @@ CAN_HandleTypeDef CAN_Handle = {
         CAN_BS1_13TQ, //TimeSeg1
         CAN_BS2_2TQ,  //TimeSeg2
         DISABLE,      //TimeTriggeredMode
-        DISABLE,      //AutoBusOff
+        ENABLE,       //AutoBusOff
         ENABLE,       //AutoWakeUp
         ENABLE,       //AutoRetransmission
         DISABLE,      //ReceiveFifoLocked
@@ -96,7 +96,7 @@ uint32_t CAN_Start() {
 }
 
 
-uint32_t CAN_TX(uint32_t ID, uint8_t data[8]) {
+uint32_t CAN_TX(uint32_t ID, uint8_t data[8], uint32_t timeoutMs) {
 
   //Set up the message header
   CAN_TxHeaderTypeDef txHeader = {
@@ -108,8 +108,13 @@ uint32_t CAN_TX(uint32_t ID, uint8_t data[8]) {
     DISABLE                     //No time triggered mode
   };
 
-  //Wait for free mailbox
-  while (!HAL_CAN_GetTxMailboxesFreeLevel(&CAN_Handle));
+  //Wait for free mailbox with timeout to avoid deadlock.
+  uint32_t start = HAL_GetTick();
+  while (!HAL_CAN_GetTxMailboxesFreeLevel(&CAN_Handle)) {
+    if ((HAL_GetTick() - start) >= timeoutMs) {
+      return HAL_TIMEOUT;
+    }
+  }
 
   //Start the transmission
   return (uint32_t) HAL_CAN_AddTxMessage(&CAN_Handle, &txHeader, data, NULL);
@@ -134,6 +139,13 @@ uint32_t CAN_RX(uint32_t &ID, uint8_t data[8]) {
   ID = rxHeader.StdId;
 
   return result;
+}
+
+uint32_t CAN_RX_NonBlocking(uint32_t &ID, uint8_t data[8]) {
+  if (!HAL_CAN_GetRxFifoFillLevel(&CAN_Handle, 0)) {
+    return HAL_ERROR;
+  }
+  return CAN_RX(ID, data);
 }
 
 

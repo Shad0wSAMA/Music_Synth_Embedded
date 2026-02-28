@@ -12,7 +12,7 @@ enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
 
 //Constants
   const uint32_t interval = 100; //Display update interval
-  const uint32_t sampling_frequency = 22000;
+  const uint32_t sampling_frequency = 16000;
   constexpr uint8_t kNumVoices = 4;
 
 //Pin definitions
@@ -45,18 +45,19 @@ enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
   const int HKOE_BIT = 6;
   const int ALL_BITS = 0x7;
 
-  uint32_t ID = 0x123;
+  uint32_t SEND_ID = 0x123;
+  uint32_t RECEIVE_ID = 0x123;
   uint32_t stepSizes[12];
   double frequencies[12];
   int32_t sineLUT[4096];
   
   volatile uint32_t currentStepSize = 0;
-  volatile uint8_t knob3Rotation = 8;
-  volatile uint8_t knob2Rotation = 0;
+  volatile uint8_t knob3Rotation = 7;
+  volatile uint8_t knob2Rotation = 3;
   volatile uint8_t knob1Rotation = 4;
-  volatile uint8_t TX_Message[8] = {0};
+  uint8_t TX_Message[8] = {0};
   volatile uint8_t octave = 4;
-  volatile waveform_t currentWaveform = SAWTOOTH;
+  volatile waveform_t currentWaveform = TRIANGLE;
 
 struct Voice{
 uint8_t octave;
@@ -138,12 +139,30 @@ std::string wave2String(const waveform_t wave){
   return "UNKNOWN";
 }
 
+void updateWaveformFromKnob(const uint8_t knobValue){
+  switch (knobValue) {
+    case 0: currentWaveform = SAWTOOTH; break;
+    case 1: currentWaveform = SINE;     break;
+    case 2: currentWaveform = SQUARE;   break;
+    case 3: currentWaveform = TRIANGLE; break;
+    default: break;
+  }
+}
+
+bool queueCANCommand(const uint8_t command, const uint8_t arg1, const uint8_t arg2){
+  uint8_t msg[8] = {0};
+  msg[0] = command;
+  msg[1] = arg1;
+  msg[2] = arg2;
+  return xQueueSend(msgOutQ, msg, 0) == pdTRUE;
+}
+
 void applyKeyEvent(const uint8_t command, const uint8_t octaveValue, const uint8_t key){
   xSemaphoreTake(sysState.mutex, portMAX_DELAY);
   sysState.RX_Message[0] = command;
   sysState.RX_Message[1] = octaveValue;
   sysState.RX_Message[2] = key;
-
+  xSemaphoreGive(sysState.mutex);
   if(command == 'P'){
     for(int i = 0; i<kNumVoices; i++){
       if(voices[i].active){
@@ -169,7 +188,21 @@ void applyKeyEvent(const uint8_t command, const uint8_t octaveValue, const uint8
       }
     }
   }
+}
+
+void applyControlEvent(const uint8_t command, const uint8_t value){
+  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+  sysState.RX_Message[0] = command;
+  sysState.RX_Message[1] = value;
+  sysState.RX_Message[2] = 0;
   xSemaphoreGive(sysState.mutex);
+
+  if(command == 'V'){
+    knob3Rotation = (value <= 8) ? value : 8;
+  }else if(command == 'W'){
+    knob2Rotation = value & 0x03;
+    updateWaveformFromKnob(knob2Rotation);
+  }
 }
 
 void sampleISR(){
@@ -218,32 +251,34 @@ void sampleISR(){
   }
 
   if(count != 0){  
-    int32_t Vout = (phaseAcc >> 20);
+    int32_t Vout = (phaseAcc >> 24);
     //Vout = Vout >> (8-knob3Rotation); //Apply volume control
-    analogWrite(OUTR_PIN, Vout + 2048);
+    analogWrite(OUTR_PIN, Vout + 128);
   }
 
 }
 
 void CAN_RX_ISR (void) {
-	uint8_t RX_Message_ISR[8];
-	uint32_t ID;
-	CAN_RX(ID, RX_Message_ISR);
-	// Serial.print("Can Receiving: "); 
-  // Serial.println();
-  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+  uint8_t RX_Message_ISR[8];
+  uint32_t ID;
+  CAN_RX(ID, RX_Message_ISR);
+
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xQueueSendFromISR(msgInQ, RX_Message_ISR, &xHigherPriorityTaskWoken);
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 
 void CAN_TX_ISR (void) {
-  Serial.println("CAN_TX");
-	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	BaseType_t ok = xSemaphoreGiveFromISR(CAN_TX_Semaphore, &xHigherPriorityTaskWoken);
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void scanKeysTask(void * pvParameters){
   static uint32_t next = millis();
   static uint32_t count = 0;
-  const TickType_t xFrequency = 20/portTICK_PERIOD_MS;
+  const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
   static std::bitset<32> inputs;
   static std::bitset<32> old_inputs;
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -263,6 +298,8 @@ void scanKeysTask(void * pvParameters){
     xSemaphoreGive(sysState.mutex);
     
     std::bitset<32> changed = inputs ^ old_inputs;
+    const uint8_t oldKnob3Rotation = knob3Rotation;
+    const uint8_t oldKnob2Rotation = knob2Rotation;
 
     uint8_t prevAB3 = (static_cast<uint8_t>(old_inputs[12]) << 1) | static_cast<uint8_t>(old_inputs[13]);
     uint8_t nowAB3 = (static_cast<uint8_t>(inputs[12]) << 1) | static_cast<uint8_t>(inputs[13]);
@@ -286,43 +323,42 @@ void scanKeysTask(void * pvParameters){
     if ((t1 == 0b0001 || t1 == 0b1110) && knob1Rotation > 0) knob1Rotation--;
     if ((t1 == 0b1011 || t1 == 0b0100) && knob1Rotation < 8) knob1Rotation++;
 
-    switch (knob2Rotation) {
-      case 0: currentWaveform = SAWTOOTH; break;
-      case 1: currentWaveform = SINE;     break;
-      case 2: currentWaveform = SQUARE;   break;
-      case 3: currentWaveform = TRIANGLE; break;
-    }
+    updateWaveformFromKnob(knob2Rotation);
     octave = knob1Rotation;
+
+    if (knob3Rotation != oldKnob3Rotation){
+      applyControlEvent('V', knob3Rotation);
+      queueCANCommand('V', knob3Rotation, 0);
+    }
+    if (knob2Rotation != oldKnob2Rotation){
+      applyControlEvent('W', knob2Rotation);
+      queueCANCommand('W', knob2Rotation, 0);
+    }
 
     if(!changed.none()){
       for(int i = 0; i<12; i++){
         if(changed[i]){
           if(!inputs[i]){
-            Serial.print("Pushed: ");
-            Serial.println(i);
             TX_Message[0] = 'P';
             TX_Message[1] = octave;
             TX_Message[2] = i;
             applyKeyEvent('P', octave, i);
           }else{
-            Serial.print("Released: ");
-            Serial.println(i);
             TX_Message[0] = 'R';
             TX_Message[1] = octave;
             TX_Message[2] = i;
             applyKeyEvent('R', octave, i);
           }
-          uint8_t* msg_ptr = (uint8_t*) TX_Message;
+          queueCANCommand(TX_Message[0], TX_Message[1], TX_Message[2]);
         }
       }
     }
-
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
 }
 
 void displayKeysTask(void * pvParameters){
-  const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
+  const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   while(true){
     u8g2.clearBuffer();         // clear the internal memory
@@ -368,19 +404,23 @@ void decodeTask(void * pvParameters){
   while(true){
     xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
     uint8_t command = RX_Message[0];
-    uint8_t octave = RX_Message[1];
-    uint8_t key = RX_Message[2];
-    applyKeyEvent(command, octave, key);
+    if(command == 'P' || command == 'R'){
+      uint8_t octave = RX_Message[1];
+      uint8_t key = RX_Message[2];
+      applyKeyEvent(command, octave, key);
+    }else if(command == 'V' || command == 'W'){
+      applyControlEvent(command, RX_Message[1]);
+    }
   }
 }
 
 void CAN_TX_Task(void * pvParameters){
 	uint8_t msgOut[8];
+  const TickType_t txSemaphoreTimeout = pdMS_TO_TICKS(20);
 	while (true) {
 		xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
 		xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
-    Serial.println("Received CAN_TX");
-		CAN_TX(0x123, msgOut);
+		CAN_TX(SEND_ID, msgOut);
 	}
 }
 
@@ -388,7 +428,6 @@ void CAN_TX_Task(void * pvParameters){
 
 void setup() {
   // put your setup code here, to run once:
-  analogWriteResolution(12);
   msgInQ = xQueueCreate(36,8);
   msgOutQ = xQueueCreate(36,8);
   sysState.mutex = xSemaphoreCreateMutex();
@@ -422,8 +461,7 @@ void setup() {
   digitalWrite(REN_PIN, HIGH);
   
   //Initialise UART
-  Serial.begin(9600);
-  Serial.println("Serial initialized");
+  Serial.begin(115200);
 
   for (int i = 0; i < 4096; i++) {
     double phase = (2.0 * PI * static_cast<double>(i)) / 4096;
@@ -456,7 +494,7 @@ void setup() {
   xTaskCreate(
   scanKeysTask,		/* Function that implements the task */
   "scanKeys",		/* Text name for the task */
-  64,      		/* Stack size in words, not bytes */
+  256,      		/* Stack size in words, not bytes */
   NULL,			/* Parameter passed into the task */
   1,			/* Task priority */
   &scanKeysHandle );	/* Pointer to store the task handle */
@@ -465,7 +503,7 @@ void setup() {
   xTaskCreate(
   displayKeysTask,		/* Function that implements the task */
   "displayKeys",		/* Text name for the task */
-  64,      		/* Stack size in words, not bytes */
+  256,      		/* Stack size in words, not bytes */
   NULL,			/* Parameter passed into the task */
   2,			/* Task priority */
   &displayKeysHandle );	/* Pointer to store the task handle */
@@ -474,16 +512,16 @@ void setup() {
   xTaskCreate(
   decodeTask,		/* Function that implements the task */
   "decode",		/* Text name for the task */
-  64,      		/* Stack size in words, not bytes */
+  256,      		/* Stack size in words, not bytes */
   NULL,			/* Parameter passed into the task */
   1,			/* Task priority */
   &decodeHandle );	/* Pointer to store the task handle */
 
   TaskHandle_t CANTXHandle = NULL;
-  xTaskCreate(CAN_TX_Task,"CAN_TX",64,NULL,1,&CANTXHandle );	
+  xTaskCreate(CAN_TX_Task,"CAN_TX",256,NULL,1,&CANTXHandle );	
 
   CAN_Init(false);
-  setCANFilter(0x123,0x7ff);
+  setCANFilter(RECEIVE_ID,0x7ff);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
