@@ -47,6 +47,8 @@ QueueHandle_t msgInQ;
 volatile uint8_t RX_Message[8] = {0};
 QueueHandle_t msgOutQ;
 SemaphoreHandle_t CAN_TX_Semaphore;
+uint32_t SEND_ID = 0x123;
+uint32_t RECEIVE_ID = 0x123;
 
 // ---- Loudness compensation ----
 volatile int8_t currentNoteIdx = -1;   // -1 = no key pressed
@@ -110,11 +112,20 @@ volatile uint8_t toneK     = 0;       // 0..8 (滤波强度/闷度)
 volatile int8_t octaveShift = 0;  // 以 1 为单位：+1=上移一八度，-1=下移一八度
 volatile uint16_t joyXRaw = 520;
 volatile uint8_t joyMode = 0;     // 0=vibrato, 1=portamento
+volatile uint16_t remotePressedMask = 0; // bit i = remote key i pressed
 // （你已有 joyXRaw）
 
 const char* noteNames[12] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
 };
+
+bool queueCANCommand(const uint8_t command, const uint8_t arg1, const uint8_t arg2) {
+  uint8_t msg[8] = {0};
+  msg[0] = command;
+  msg[1] = arg1;
+  msg[2] = arg2;
+  return xQueueSend(msgOutQ, msg, 0) == pdTRUE;
+}
 
 std::bitset<4> readCols() {
 
@@ -346,6 +357,7 @@ void scanKeysTask(void * pvParameters) {
         uint8_t m = __atomic_load_n(&joyMode, __ATOMIC_RELAXED);
         m ^= 1;
         __atomic_store_n(&joyMode, m, __ATOMIC_RELAXED);
+        queueCANCommand('J', m, 0);
       }
     }
     lastJoyPressed = joyPressed;
@@ -356,11 +368,7 @@ void scanKeysTask(void * pvParameters) {
       bool curr = localInputs[k];
 
       if (prev != curr) {
-        uint8_t msg[8] = {0};                 // ✅ 推荐：局部数组，避免多文件重复定义
-        msg[0] = (curr == 0) ? 'P' : 'R';
-        msg[1] = 4;
-        msg[2] = (uint8_t)k;
-        xQueueSend(msgOutQ, msg, portMAX_DELAY);
+        queueCANCommand((curr == 0) ? 'P' : 'R', 4, (uint8_t)k);
       }
     }
 
@@ -374,6 +382,11 @@ void scanKeysTask(void * pvParameters) {
     k1 = sysState.knob1Rotation;   // duty
     k0 = sysState.knob0Rotation;   // wave
     xSemaphoreGive(sysState.mutex);
+
+    int oldK3 = k3;
+    int oldK2 = k2;
+    int oldK1 = k1;
+    int oldK0 = k0;
 
     updateEncoderOnMatrixRowFullStep(3, 1, 0, prevK3, accK3, k3, 0, 8, INVERT_ALL_KNOBS);
     updateEncoderOnMatrixRowFullStep(3, 3, 2, prevK2, accK2, k2, 0, 8, INVERT_ALL_KNOBS);
@@ -394,6 +407,19 @@ void scanKeysTask(void * pvParameters) {
 
 
     __atomic_store_n(&toneK, (uint8_t)k2, __ATOMIC_RELAXED);
+
+    if (k3 != oldK3) {
+      queueCANCommand('V', (uint8_t)k3, 0);
+    }
+    if (k2 != oldK2) {
+      queueCANCommand('W', (uint8_t)k2, 0);
+    }
+    if (k1 != oldK1) {
+      queueCANCommand('D', (uint8_t)k1, 0);
+    }
+    if (k0 != oldK0) {
+      queueCANCommand('M', (uint8_t)k0, 0);
+    }
 
     // ---- joystick octave shift (discrete) ----
     static uint8_t joyState = 0; // 0=center, 1=left, 2=right
@@ -432,11 +458,13 @@ void scanKeysTask(void * pvParameters) {
       int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
       if (os > -3) os -= 1;   // 左：降八度
       __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
+      queueCANCommand('O', (uint8_t)(os + 3), 0);
     }
     if (joyState == 0 && newState == 2) {
       int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
       if (os < 3) os += 1;    // 右：升八度
       __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
+      queueCANCommand('O', (uint8_t)(os + 3), 0);
     }
 
     joyState = newState;
@@ -451,8 +479,11 @@ void scanKeysTask(void * pvParameters) {
     int n = 0;
     int8_t mainNoteIdx = -1;
 
+    uint16_t remoteMask = __atomic_load_n(&remotePressedMask, __ATOMIC_RELAXED);
     for (int i = 0; i < 12 && n < NVOICE; i++) {
-      if (localInputs[i] == 0) {
+      bool localPressed = (localInputs[i] == 0);
+      bool remotePressed = ((remoteMask >> i) & 0x01u) != 0u;
+      if (localPressed || remotePressed) {
         uint32_t st = stepSizes[i];
         mainNoteIdx = (mainNoteIdx < 0) ? (int8_t)i : mainNoteIdx; // 第一个按下当主音
 
@@ -782,13 +813,17 @@ void displayUpdateTask(void * pvParameters) {
 void CAN_RX_ISR(void) {
     uint8_t rx_isr[8];
     uint32_t ID;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
     CAN_RX(ID, rx_isr);
-    xQueueSendFromISR(msgInQ, rx_isr, NULL);
+    xQueueSendFromISR(msgInQ, rx_isr, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void CAN_TX_ISR(void) {
-  xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(CAN_TX_Semaphore, &xHigherPriorityTaskWoken);
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void CAN_TX_Task(void *pvParameters) {
@@ -797,7 +832,7 @@ void CAN_TX_Task(void *pvParameters) {
   while (1) {
     xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
     xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
-    CAN_TX(0x123, msgOut);
+    CAN_TX(SEND_ID, msgOut);
   }
 }
 
@@ -812,37 +847,60 @@ void decodeTask(void *pvParameters) {
             RX_Message[i] = localMsg[i];
         }
 
-        // 播放音符逻辑
         char type = (char)localMsg[0];
-        uint8_t octave = localMsg[1];
-        uint8_t note = localMsg[2];
-
-        uint32_t step = 0;
-
-        if (type == 'P') {
-            step = stepSizes[note];
-            // ✅ apply octave shift (same as scanKeysTask)
-            int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
-            if (step != 0) {
-              if (os > 0) step <<= os;
-              else if (os < 0) step >>= (-os);
-            }
-            if (octave > 4)
-                step <<= (octave - 4);
-            else if (octave < 4)
-                step >>= (4 - octave);
+        if (type == 'P' || type == 'R') {
+          uint8_t key = localMsg[2];
+          if (key < 12) {
+            uint16_t mask = __atomic_load_n(&remotePressedMask, __ATOMIC_RELAXED);
+            uint16_t bit = (uint16_t)(1u << key);
+            if (type == 'P') mask |= bit;
+            else mask &= (uint16_t)(~bit);
+            __atomic_store_n(&remotePressedMask, mask, __ATOMIC_RELAXED);
+          }
+        } else if (type == 'V') {
+          uint8_t v = localMsg[1];
+          if (v > 8) v = 8;
+          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+          sysState.knob3Rotation = v;
+          xSemaphoreGive(sysState.mutex);
+        } else if (type == 'W') {
+          uint8_t t = localMsg[1];
+          if (t > 8) t = 8;
+          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+          sysState.knob2Rotation = t;
+          xSemaphoreGive(sysState.mutex);
+          __atomic_store_n(&toneK, t, __ATOMIC_RELAXED);
+        } else if (type == 'D') {
+          uint8_t d = localMsg[1];
+          if (d > 8) d = 8;
+          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+          sysState.knob1Rotation = d;
+          xSemaphoreGive(sysState.mutex);
+        } else if (type == 'M') {
+          uint8_t m = localMsg[1];
+          if (m > 8) m = 8;
+          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+          sysState.knob0Rotation = m;
+          xSemaphoreGive(sysState.mutex);
+          __atomic_store_n(&waveSel, m, __ATOMIC_RELAXED);
+        } else if (type == 'J') {
+          uint8_t jm = localMsg[1] & 0x01;
+          __atomic_store_n(&joyMode, jm, __ATOMIC_RELAXED);
+        } else if (type == 'O') {
+          int8_t os = (int8_t)localMsg[1] - 3;
+          if (os < -3) os = -3;
+          if (os > 3) os = 3;
+          __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
         }
-        else if (type == 'R') {
-            step = 0;
-        }
-
-        /// __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
     }
 }
 
 void setup() {
   // put your setup code here, to run once:
   sysState.mutex = xSemaphoreCreateMutex();
+  msgInQ = xQueueCreate(36, 8);
+  msgOutQ = xQueueCreate(36, 8);
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
   sysState.knob3Rotation = 8;   // 默认最大音量
   initSineTable();
 
@@ -888,6 +946,7 @@ void setup() {
   NULL,			/* Parameter passed into the task */
   2,			/* Task priority */
   &scanKeysHandle );	/* Pointer to store the task handle */
+
   TaskHandle_t displayHandle = NULL;
   xTaskCreate(
     displayUpdateTask,
@@ -916,12 +975,9 @@ void setup() {
     NULL
   );
 
-  CAN_Init(true);          // true=loopback
-  setCANFilter(0x123, 0x7ff);
-  msgInQ = xQueueCreate(36, 8);
+  CAN_Init(false);
+  setCANFilter(RECEIVE_ID, 0x7ff);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
-  msgOutQ = xQueueCreate(36, 8);
-  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
 
