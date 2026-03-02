@@ -1,20 +1,11 @@
-
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <bitset>
-#include <vector>
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
-#include <unordered_map>
-#include <cmath>
-#include <Wire.h>
-
-enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
 
 //Constants
   const uint32_t interval = 100; //Display update interval
-  const uint32_t sampling_frequency = 16000;
-  constexpr uint8_t kNumVoices = 4;
 
 //Pin definitions
   //Row select and enable
@@ -29,7 +20,6 @@ enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
   const int C2_PIN = A6;
   const int C3_PIN = D1;
   const int OUT_PIN = D11;
-  const int KNOB_INT_PIN = PA10;
 
   //Audio analogue out
   const int OUTL_PIN = A4;
@@ -45,88 +35,637 @@ enum waveform_t {SINE, SQUARE, TRIANGLE, SAWTOOTH};
   const int DRST_BIT = 4;
   const int HKOW_BIT = 5;
   const int HKOE_BIT = 6;
-  const int ALL_BITS = 0x7;
-
-  uint32_t SEND_ID = 0x123;
-  uint32_t RECEIVE_ID = 0x123;
-  uint32_t stepSizes[12];
-  double frequencies[12];
-  int32_t sineLUT[4096];
-  
-  volatile uint32_t currentStepSize = 0;
-  volatile uint8_t knob3Rotation = 7;
-  volatile uint8_t knob2Rotation = 3;
-  volatile uint8_t knob1Rotation = 4;
-  uint8_t TX_Message[8] = {0};
-  volatile uint8_t octave = 4;
-  volatile waveform_t currentWaveform = TRIANGLE;
-
-struct Voice{
-uint8_t octave;
-uint8_t key;
-uint32_t phase;
-uint32_t step;
-uint32_t value;
-bool active;
-};
-
-QueueHandle_t msgInQ;
-QueueHandle_t msgOutQ;
-HardwareTimer sampleTimer(TIM1);
-SemaphoreHandle_t CAN_TX_Semaphore;
-SemaphoreHandle_t i2cMutex;
-SemaphoreHandle_t knobIntSem;
-
-volatile Voice voices[kNumVoices];
-
-struct {
-std::bitset<32> inputs; 
-uint8_t RX_Message[8] = {0};
-SemaphoreHandle_t mutex;
-} sysState;
 
 //Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-// README matrix map: index = row*4 + col
-const char * const INPUT_MAP[32] = {
-  "Key C",        "Key C#",       "Key D",        "Key D#",
-  "Key E",        "Key F",        "Key F#",       "Key G",
-  "Key G#",       "Key A",        "Key A#",       "Key B",
-  "Knob 3 A",     "Knob 3 B",     "Knob 2 A",     "Knob 2 B",
-  "Knob 1 A",     "Knob 1 B",     "Knob 0 A",     "Knob 0 B",
-  "Knob 2 S",     "Knob 3 S",     "Joystick S",   "West Detect",
-  "Knob 0 S",     "Knob 1 S",     "Unused",       "East Detect",
-  "Unused",       "Unused",       "Unused",       "Unused"
+HardwareTimer sampleTimer(TIM1);
+volatile uint32_t currentStepSize = 0;
+/// volatile uint8_t TX_Message[8] = {0};
+
+QueueHandle_t msgInQ;
+volatile uint8_t RX_Message[8] = {0};
+QueueHandle_t msgOutQ;
+SemaphoreHandle_t CAN_TX_Semaphore;
+
+// ---- Loudness compensation ----
+volatile int8_t currentNoteIdx = -1;   // -1 = no key pressed
+
+// C..B 的补偿（Q8.8：256=1.0倍）
+// 低音更大，高音更小（你可以后面微调）
+const uint16_t noteGainQ88[12] = {
+  460, 450, 440, 430,
+  420, 410, 400, 390,
+  380, 360, 340, 320
 };
 
-uint8_t pcalReadInputs() {
-  constexpr uint8_t kPcalAddr = 0x21;
-  constexpr uint8_t kInputReg = 0x00;
+// octaveShift: -3..+3 的补偿（Q8.8）
+// 下移八度更大，上移八度更小（更符合你“低频太小”的现象）
+const uint16_t octGainQ88[7] = {
+  640, 520, 400, 256, 224, 208, 192
+  // os=-3  -2   -1    0    +1   +2   +3
+};
 
-  Wire.beginTransmission(kPcalAddr);
-  Wire.write(kInputReg);
-  if (Wire.endTransmission(false) != 0) {
-    return 0xFF;
-  }
+enum Waveform : uint8_t {
+  W_SAW=0,
+  W_SQUARE=1,
+  W_TRI=2,
+  W_SINE=3,
+  W_SAW_SINE=4,
+  W_SQUARE_SINE=5,
+  W_DETUNE_SQUARE=6,
+  W_DETUNE_SAW=7,
+  W_SUPER_SAW=8
+};
 
-  if (Wire.requestFrom(kPcalAddr, static_cast<uint8_t>(1)) != 1) {
-    return 0xFF;
-  }
+// Per-wave loudness compensation (Q8.8; 256=1.0x)
+const uint16_t waveGainQ88[9] = {
+  256, // W_SAW
+  200, // W_SQUARE  (方波 RMS 高，适当小一点)
+  330, // W_TRI     (三角 RMS 低，拉大一点)
+  320, // W_SINE    (正弦 RMS 更低，再大一点)
+  280, // W_SAW_SINE
+  240, // W_SQUARE_SINE
+  220, // W_DETUNE_SQUARE
+  260, // W_DETUNE_SAW
+  220  // W_SUPER_SAW (叠加更厚，别太大)
+};
 
-  return Wire.read();
+constexpr int NVOICE = 4;
+
+
+struct Voice {
+  uint32_t step;    // 已经包含 octave + bend（scan task 算好）
+  uint32_t phase;   // 主相位
+  uint32_t phase2;  // 仅主音用 detune/supersaw
+  uint32_t phase3;  // 仅主音用 detune/supersaw
+};
+
+volatile Voice voices[NVOICE];
+
+volatile uint16_t joyYRaw = 520;   // 你测到中心是520
+
+volatile uint8_t waveSel   = W_SAW;   // 0..3
+volatile uint8_t toneK     = 0;       // 0..8 (滤波强度/闷度)
+volatile int8_t octaveShift = 0;  // 以 1 为单位：+1=上移一八度，-1=下移一八度
+volatile uint16_t joyXRaw = 520;
+volatile uint8_t joyMode = 0;     // 0=vibrato, 1=portamento
+// （你已有 joyXRaw）
+
+const char* noteNames[12] = {
+  "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
+std::bitset<4> readCols() {
+
+  std::bitset<4> result;
+  /*
+  // ---- Select Row 0 ----
+  digitalWrite(REN_PIN, LOW);   // Disable row select while changing address
+
+  digitalWrite(RA0_PIN, LOW);   // RA2 RA1 RA0 = 000
+  digitalWrite(RA1_PIN, LOW);
+  digitalWrite(RA2_PIN, LOW);
+
+  digitalWrite(REN_PIN, HIGH);  // Enable row (drives R0 low)
+  */
+  
+  // ---- Read columns ----
+  result[0] = digitalRead(C0_PIN);
+  result[1] = digitalRead(C1_PIN);
+  result[2] = digitalRead(C2_PIN);
+  result[3] = digitalRead(C3_PIN);
+
+  return result;
+}
+constexpr float FS = 22000.0f;
+constexpr double TWO32 = 4294967296.0; // 2^32
+
+
+struct {
+    std::bitset<32> inputs;
+    int knob3Rotation;   // ✅ 你原来的：音量
+    int knob0Rotation;   // 波形选择
+    int knob1Rotation;   // 
+    int knob2Rotation;   // tone/filter
+    SemaphoreHandle_t mutex;
+} sysState;
+
+constexpr float noteFreq[12] = {
+  261.6256f, 277.1826f, 293.6648f, 311.1270f,
+  329.6276f, 349.2282f, 369.9944f, 391.9954f,
+  415.3047f, 440.0000f, 466.1638f, 493.8833f
+};
+
+void setRow(uint8_t rowIdx) {
+  digitalWrite(REN_PIN, LOW);            // disable to avoid glitches
+
+  digitalWrite(RA0_PIN, rowIdx & 0x01);
+  digitalWrite(RA1_PIN, (rowIdx >> 1) & 0x01);
+  digitalWrite(RA2_PIN, (rowIdx >> 2) & 0x01);
+
+  digitalWrite(REN_PIN, HIGH);           // enable again
 }
 
-void pcalWriteReg(const uint8_t reg, const uint8_t value) {
-  constexpr uint8_t kPcalAddr = 0x21;
-  Wire.beginTransmission(kPcalAddr);
-  Wire.write(reg);
-  Wire.write(value);
-  (void)Wire.endTransmission();
+/*
+static inline int16_t renderWave(uint8_t mode, uint32_t step, Voice &v) {
+  v.phase += step;
+  uint8_t p = (uint8_t)(v.phase >> 24);
+  int16_t x = 0;
+
+  switch (mode) {
+    case W_SAW: {
+      int16_t s = (int16_t)p - 128;
+      s = s * 2;
+      x = clamp8(s);
+      break;
+    }
+    case W_SQUARE:
+      x = (v.phase & 0x80000000u) ? 127 : -128;
+      break;
+
+    case W_TRI: {
+      uint8_t triU = (p < 128) ? (p << 1) : ((255 - p) << 1);
+      int16_t s = (int16_t)triU - 128;
+      s = s * 2;
+      x = clamp8(s);
+      break;
+    }
+
+    case W_SINE: {
+      int16_t s = sineTable[p];
+      s = s * 3;
+      x = clamp8(s);
+      break;
+    }
+
+    case W_SAW_SINE: {
+      int16_t saw = (int16_t)p - 128;
+      int16_t sin = (int16_t)sineTable[p];
+      x = (3*saw + sin) / 4;
+      break;
+    }
+
+    case W_SQUARE_SINE: {
+      int16_t sq  = (v.phase & 0x80000000u) ? 127 : -128;
+      int16_t sin = (int16_t)sineTable[p];
+      x = (sq + sin) / 2;
+      break;
+    }
+
+    // detune/supersaw 先不做，或降级
+    default:
+      x = (int16_t)p - 128;
+      break;
+  }
+  return x;
+}
+*/
+
+const uint32_t stepSizes[12] = {
+  (uint32_t)(TWO32 * noteFreq[0]  / FS),
+  (uint32_t)(TWO32 * noteFreq[1]  / FS),
+  (uint32_t)(TWO32 * noteFreq[2]  / FS),
+  (uint32_t)(TWO32 * noteFreq[3]  / FS),
+  (uint32_t)(TWO32 * noteFreq[4]  / FS),
+  (uint32_t)(TWO32 * noteFreq[5]  / FS),
+  (uint32_t)(TWO32 * noteFreq[6]  / FS),
+  (uint32_t)(TWO32 * noteFreq[7]  / FS),
+  (uint32_t)(TWO32 * noteFreq[8]  / FS),
+  (uint32_t)(TWO32 * noteFreq[9]  / FS),   // A4 index 9
+  (uint32_t)(TWO32 * noteFreq[10] / FS),
+  (uint32_t)(TWO32 * noteFreq[11] / FS)
+
+};
+
+// 256-point sine table, range -128..127
+#include <math.h>
+
+int8_t sineTable[256];
+
+void initSineTable() {
+    for (int i = 0; i < 256; i++) {
+        float angle = 2.0f * M_PI * i / 256.0f;
+        sineTable[i] = (int8_t)(127.0f * sinf(angle));
+    }
+};
+
+static inline int8_t quadDelta(uint8_t prev, uint8_t curr, bool invert) {
+  // index = prev*4 + curr
+  // Table gives +1/-1 for valid quadrature steps, 0 otherwise (bounce/invalid)
+  static const int8_t table[16] = {
+    0, -1, +1,  0,
+    +1, 0,  0, -1,
+    -1, 0,  0, +1,
+     0, +1, -1, 0
+  };
+
+  int8_t d = table[(prev << 2) | curr];
+  return invert ? -d : d;
 }
 
-void knobIntISR() {
-  xSemaphoreGiveFromISR(knobIntSem, NULL);
+static inline int16_t clamp8(int16_t s){
+  if (s > 127) return 127;
+  if (s < -128) return -128;
+  return s;
+}
+
+static inline int16_t softClip8(int16_t s) {
+  int16_t a = (s < 0) ? -s : s;
+  int16_t denom = 128 + a;
+  return (s * 128) / denom;
+}
+
+static inline void updateEncoderOnMatrixRowFullStep(
+  uint8_t row, uint8_t colB, uint8_t colA,
+  uint8_t &prevState,
+  int8_t  &acc,                 // ✅ 新增：累计器
+  int &value, int vmin, int vmax,
+  bool invertDirection
+){
+  setRow(row);
+  delayMicroseconds(3);
+  std::bitset<4> cols = readCols();
+
+  uint8_t currState = (uint8_t)((cols[colB] << 1) | cols[colA]);
+  int8_t d = quadDelta(prevState, currState, invertDirection);
+  prevState = currState;
+
+  if (d != 0) {
+    acc += d;
+
+    // ✅ 方案B：满 4 个有效边沿才算 1 格（完成一整步）
+    if (acc >= 4)  { value += 1; acc = 0; }
+    if (acc <= -4) { value -= 1; acc = 0; }
+
+    if (value > vmax) value = vmax;
+    if (value < vmin) value = vmin;
+  }
+}
+
+
+void scanKeysTask(void * pvParameters) {
+
+  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const bool INVERT_ALL_KNOBS = true;
+
+  std::bitset<12> prevKeys;
+  prevKeys.set();   // 未按=1，按下=0
+
+  // 每个旋钮一个 prevState（放外面，保持状态）
+  static uint8_t prevK3 = 0, prevK2 = 0, prevK1 = 0, prevK0 = 0;
+  static int8_t accK3 = 0, accK2 = 0, accK1 = 0, accK0 = 0;
+
+  while (1) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    // ---- scan keys rows 0..2 ----
+    std::bitset<32> localInputs;
+    localInputs.reset();
+
+    for (uint8_t row = 0; row < 7; row++) {   // 0..6
+      setRow(row);
+      delayMicroseconds(3);
+      std::bitset<4> cols = readCols();
+      for (uint8_t c = 0; c < 4; c++) {
+        localInputs[row * 4 + c] = cols[c];
+      }
+    }
+
+    // ---- joystick press (matrix row5 col2 -> index 22) : toggle mode ----
+    static bool lastJoyPressed = false;
+    static TickType_t lastToggleTick = 0;
+
+    bool joyPressed = (localInputs[22] == 0);  // active low
+
+    if (!lastJoyPressed && joyPressed) {       // falling edge: not pressed -> pressed
+      TickType_t now = xTaskGetTickCount();
+      if (now - lastToggleTick > (200 / portTICK_PERIOD_MS)) { // debounce 200ms
+        lastToggleTick = now;
+        uint8_t m = __atomic_load_n(&joyMode, __ATOMIC_RELAXED);
+        m ^= 1;
+        __atomic_store_n(&joyMode, m, __ATOMIC_RELAXED);
+      }
+    }
+    lastJoyPressed = joyPressed;
+
+    // ---- compare + send CAN ----
+    for (int k = 0; k < 12; k++) {
+      bool prev = prevKeys[k];
+      bool curr = localInputs[k];
+
+      if (prev != curr) {
+        uint8_t msg[8] = {0};                 // ✅ 推荐：局部数组，避免多文件重复定义
+        msg[0] = (curr == 0) ? 'P' : 'R';
+        msg[1] = 4;
+        msg[2] = (uint8_t)k;
+        xQueueSend(msgOutQ, msg, portMAX_DELAY);
+      }
+    }
+
+    for (int k = 0; k < 12; k++) prevKeys[k] = localInputs[k];
+
+    // ---- knobs (统一方向) ----
+    int k3, k2, k1, k0;
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    k3 = sysState.knob3Rotation;   // volume
+    k2 = sysState.knob2Rotation;   // tone
+    k1 = sysState.knob1Rotation;   // duty
+    k0 = sysState.knob0Rotation;   // wave
+    xSemaphoreGive(sysState.mutex);
+
+    updateEncoderOnMatrixRowFullStep(3, 1, 0, prevK3, accK3, k3, 0, 8, INVERT_ALL_KNOBS);
+    updateEncoderOnMatrixRowFullStep(3, 3, 2, prevK2, accK2, k2, 0, 8, INVERT_ALL_KNOBS);
+    updateEncoderOnMatrixRowFullStep(4, 1, 0, prevK1, accK1, k1, 0, 8, INVERT_ALL_KNOBS);
+    updateEncoderOnMatrixRowFullStep(4, 3, 2, prevK0, accK0, k0, 0, 8, INVERT_ALL_KNOBS);
+
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    sysState.knob3Rotation = k3;
+    sysState.knob2Rotation = k2;
+    sysState.knob1Rotation = k1;
+    sysState.knob0Rotation = k0;
+    sysState.inputs = localInputs;
+    xSemaphoreGive(sysState.mutex);
+ 
+    // ---- map knobs -> synth params ----
+    uint8_t ws = (uint8_t)k0;   // k0 已经 clamp 到 0..8
+    __atomic_store_n(&waveSel, ws, __ATOMIC_RELAXED);
+
+
+    __atomic_store_n(&toneK, (uint8_t)k2, __ATOMIC_RELAXED);
+
+    // ---- joystick octave shift (discrete) ----
+    static uint8_t joyState = 0; // 0=center, 1=left, 2=right
+
+    // ---- joystick analog ----
+    uint16_t xRaw = (uint16_t)analogRead(JOYX_PIN);
+    uint16_t yRaw = (uint16_t)analogRead(JOYY_PIN);
+
+    __atomic_store_n(&joyXRaw, xRaw, __ATOMIC_RELAXED);
+    __atomic_store_n(&joyYRaw, yRaw, __ATOMIC_RELAXED);
+
+    // ---- pitch bend (X): map to [-2, +2] semitone, with deadzone ----
+    const int32_t JOY_CENTER = 520;
+    const int32_t JOY_HALFSPAN = 520;   // 大约到边界
+    const int32_t DEAD = 25;            // 先给大一点，避免抖
+
+    int32_t dx = (int32_t)xRaw - JOY_CENTER;
+    if (dx > -DEAD && dx < DEAD) dx = 0;
+
+    float bend = (float)dx / (float)JOY_HALFSPAN * 2.0f;   // ±2 semitone
+    if (bend >  2.0f) bend =  2.0f;
+    if (bend < -2.0f) bend = -2.0f;
+
+    float bendRatio = powf(2.0f, bend / 12.0f);
+
+    const uint16_t LEFT_TH  = 760;
+    const uint16_t RIGHT_TH = 260;
+
+    uint8_t newState = 0;
+    if (xRaw <= RIGHT_TH) newState = 2;      // ✅ right
+    else if (xRaw >= LEFT_TH) newState = 1;  // ✅ left
+    else newState = 0;
+
+    // center -> left/right 触发一次
+    if (joyState == 0 && newState == 1) {
+      int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
+      if (os > -3) os -= 1;   // 左：降八度
+      __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
+    }
+    if (joyState == 0 && newState == 2) {
+      int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
+      if (os < 3) os += 1;    // 右：升八度
+      __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
+    }
+
+    joyState = newState;
+
+    // ---- choose note ----
+    // ---- collect pressed keys -> voices (polyphony) ----
+    uint32_t steps[NVOICE] = {0};
+
+    int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
+
+    // 这里用“从左到右”取最多 NVOICE 个键，你也可以反过来
+    int n = 0;
+    int8_t mainNoteIdx = -1;
+
+    for (int i = 0; i < 12 && n < NVOICE; i++) {
+      if (localInputs[i] == 0) {
+        uint32_t st = stepSizes[i];
+        mainNoteIdx = (mainNoteIdx < 0) ? (int8_t)i : mainNoteIdx; // 第一个按下当主音
+
+        // octave shift
+        if (os > 0) st <<= os;
+        else if (os < 0) st >>= (-os);
+
+        // pitch bend
+        st = (uint32_t)((float)st * bendRatio);
+
+        steps[n++] = st;
+      }
+    }
+
+    __atomic_store_n(&currentNoteIdx, mainNoteIdx, __ATOMIC_RELAXED);
+
+    // 原子写入 voices steps（phase 保持不动，避免“相位跳”）
+    for (int v = 0; v < NVOICE; v++) {
+      __atomic_store_n(&voices[v].step, steps[v], __ATOMIC_RELAXED);
+    }
+  }
+}
+
+
+void sampleISR() {
+  static int32_t lp = 0;                // master filter state
+  static uint32_t smoothStep0 = 0;      // portamento only for voice0
+  static uint32_t vibPhase0 = 0;        // vibrato LFO only for voice0
+
+  uint8_t mode = __atomic_load_n(&waveSel, __ATOMIC_RELAXED);
+  uint8_t k    = __atomic_load_n(&toneK, __ATOMIC_RELAXED);
+
+  // joystick Y (10-bit, center=520)
+  uint16_t yRaw = __atomic_load_n(&joyYRaw, __ATOMIC_RELAXED);
+  int32_t dy = (int32_t)yRaw - 520;
+  if (dy > -60 && dy < 60) dy = 0;      // deadzone
+
+  uint32_t ady = (dy < 0) ? -dy : dy;
+  uint32_t depth = 0;
+  const uint32_t START = 60;            // 门槛：静止不抖
+  if (ady > START) {
+    depth = (ady - START) * 255 / (520 - START);
+    if (depth > 255) depth = 255;
+  }
+
+  uint8_t jm = __atomic_load_n(&joyMode, __ATOMIC_RELAXED);
+
+  int32_t mix = 0;
+  int activeCount = 0;
+
+  // ========= Voice loop =========
+  for (int v = 0; v < NVOICE; v++) {
+    uint32_t st = __atomic_load_n(&voices[v].step, __ATOMIC_RELAXED);
+    if (st == 0) continue;
+
+    activeCount++;
+
+    // ----- only voice0 has port/vib + detune/supersaw -----
+    if (v == 0) {
+      // portamento on step
+      if (jm == 1) {
+        if (smoothStep0 == 0) smoothStep0 = st;
+
+        // Y down = slower glide, Y up = faster glide
+        uint8_t sh;
+        if (dy >= 0) sh = 8 + (uint8_t)((uint32_t)dy * 8 / 503);   // 8..16 slow
+        else         sh = 3 + (uint8_t)((uint32_t)(-dy) * 5 / 520); // 3..8 fast
+
+        int32_t err = (int32_t)st - (int32_t)smoothStep0;
+        smoothStep0 += (uint32_t)(err >> sh);
+        st = smoothStep0;
+      } else {
+        smoothStep0 = st; // vib 模式下别让 smoothStep0 漂着
+      }
+
+      // vibrato on step
+      if (jm == 0 && depth > 0) {
+        constexpr uint32_t VIB_STEP = (uint32_t)(4294967296.0 * 6.5 / 22000.0);
+        vibPhase0 += VIB_STEP;
+        int16_t s = sineTable[(uint8_t)(vibPhase0 >> 24)];
+        int32_t mod = (int32_t)st * (int32_t)s * (int32_t)depth;
+        st = (uint32_t)((int32_t)st + (mod >> 20));  // 明显一点
+      }
+
+      // store back step used this sample (optional)
+      // (not storing to voices to avoid extra atomics)
+    }
+
+    // ----- waveform render -----
+    // phase update
+    voices[v].phase += st;
+    uint8_t p = (uint8_t)(voices[v].phase >> 24);
+
+    int16_t x = 0;
+
+    // detune/supersaw only for v==0, otherwise downgrade
+    if (v == 0 && (mode == W_DETUNE_SAW || mode == W_DETUNE_SQUARE || mode == W_SUPER_SAW)) {
+      uint32_t det = st >> 7;
+
+      if (mode == W_DETUNE_SAW) {
+        voices[v].phase2 += (st + det);
+        uint8_t p2 = (uint8_t)(voices[v].phase2 >> 24);
+
+        int16_t s1 = (int16_t)p  - 128;
+        int16_t s2 = (int16_t)p2 - 128;
+        x = (s1 + s2) / 2;
+
+      } else if (mode == W_DETUNE_SQUARE) {
+        voices[v].phase2 += (st + det);
+        int16_t sq1 = (voices[v].phase  & 0x80000000u) ? 127 : -128;
+        int16_t sq2 = (voices[v].phase2 & 0x80000000u) ? 127 : -128;
+        x = (sq1 + sq2) / 2;
+
+      } else { // W_SUPER_SAW
+        voices[v].phase2 += st + det;
+        voices[v].phase3 += st - det;
+
+        uint8_t p2 = (uint8_t)(voices[v].phase2 >> 24);
+        uint8_t p3 = (uint8_t)(voices[v].phase3 >> 24);
+
+        int16_t s1 = (int16_t)p  - 128;
+        int16_t s2 = (int16_t)p2 - 128;
+        int16_t s3 = (int16_t)p3 - 128;
+        x = (s1 + s2 + s3) / 3;
+      }
+    } else {
+      // normal modes for all voices
+      switch (mode) {
+        case W_SAW: {
+          int16_t s = (int16_t)p - 128;
+          s = s * 2;
+          x = clamp8(s);
+          break;
+        }
+        case W_SQUARE:
+          x = (voices[v].phase & 0x80000000u) ? 127 : -128;
+          break;
+
+        case W_TRI: {
+          uint8_t triU = (p < 128) ? (p << 1) : ((255 - p) << 1);
+          int16_t s = (int16_t)triU - 128;
+          s = s * 2;
+          x = clamp8(s);
+          break;
+        }
+        case W_SINE: {
+          int16_t s = sineTable[p];
+          s = s * 3;
+          x = clamp8(s);
+          break;
+        }
+        case W_SAW_SINE: {
+          int16_t saw = (int16_t)p - 128;
+          int16_t sin = (int16_t)sineTable[p];
+          x = (3*saw + sin) / 4;
+          break;
+        }
+        case W_SQUARE_SINE: {
+          int16_t sq  = (voices[v].phase & 0x80000000u) ? 127 : -128;
+          int16_t sin = (int16_t)sineTable[p];
+          x = (sq + sin) / 2;
+          break;
+        }
+        default: {
+          int16_t s = (int16_t)p - 128;
+          x = s;
+          break;
+        }
+      }
+    }
+
+    // apply per-wave loudness gain BEFORE mixing
+    uint16_t gW = waveGainQ88[mode];      // Q8.8
+    int32_t x2 = (int32_t)x * (int32_t)gW;
+    x = (int16_t)(x2 >> 8);              // back to int16
+    x = clamp8(x);
+
+    mix += x;
+  }
+
+  // ========= Output =========
+  if (activeCount == 0) {
+    lp = 0;
+    smoothStep0 = 0;
+    // vibPhase0 不清也行
+    analogWrite(OUTR_PIN, 128);
+    return;
+  }
+
+  mix /= activeCount;
+  // if (activeCount > 0) mix = mix;  // 不除
+
+  int16_t x = clamp8(mix);
+
+  // master tone low-pass (your original)
+  
+  if (k > 0) {
+    uint8_t alpha = 255 - k * 28;
+    lp = lp + ((alpha * (x - lp)) >> 8);
+    x = lp;
+
+    int16_t s = x * (int16_t)(8 + k);
+    x = s / 8;
+    if (x > 127) x = 127;
+    if (x < -128) x = -128;
+  } 
+
+  // volume + clip
+  int volume = sysState.knob3Rotation;
+  x = (x * volume) / 8;
+  x = softClip8(x);
+
+  analogWrite(OUTR_PIN, (uint8_t)(x + 128));
 }
 
 //Function to set outputs using key matrix
@@ -135,357 +674,177 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(RA0_PIN, bitIdx & 0x01);
       digitalWrite(RA1_PIN, bitIdx & 0x02);
       digitalWrite(RA2_PIN, bitIdx & 0x04);
-      digitalWrite(OUT_PIN, value);
-      digitalWrite(REN_PIN, HIGH);
+      digitalWrite(OUT_PIN,value);
+      digitalWrite(REN_PIN,HIGH);
       delayMicroseconds(2);
       digitalWrite(REN_PIN,LOW);
 }
 
-std::bitset<4> readCols(){
+void displayUpdateTask(void * pvParameters) {
 
-  std::bitset<4> result;
-  result[0] = digitalRead(C0_PIN);
-  result[1] = digitalRead(C1_PIN);
-  result[2] = digitalRead(C2_PIN);
-  result[3] = digitalRead(C3_PIN);
-  return result;
-}
-
-void setRow(const uint8_t rowIdx){
-  digitalWrite(REN_PIN, LOW);
-  digitalWrite(RA0_PIN, rowIdx & 0x01);
-  digitalWrite(RA1_PIN, rowIdx & 0x02);
-  digitalWrite(RA2_PIN, rowIdx & 0x04);
-  digitalWrite(REN_PIN, HIGH);
-}
-
-std::string wave2String(const waveform_t wave){
-  if (wave == SINE){
-    return "SINE";
-  }else if(wave == SAWTOOTH){
-    return "SAWTOOTH";
-  }else if(wave == SQUARE){
-    return "SQUARE";
-  }else if(wave == TRIANGLE){
-    return "TRIANGLE";
-  }
-  return "UNKNOWN";
-}
-
-void updateWaveformFromKnob(const uint8_t knobValue){
-  switch (knobValue) {
-    case 0: currentWaveform = SAWTOOTH; break;
-    case 1: currentWaveform = SINE;     break;
-    case 2: currentWaveform = SQUARE;   break;
-    case 3: currentWaveform = TRIANGLE; break;
-    default: break;
-  }
-}
-
-bool queueCANCommand(const uint8_t command, const uint8_t arg1, const uint8_t arg2){
-  uint8_t msg[8] = {0};
-  msg[0] = command;
-  msg[1] = arg1;
-  msg[2] = arg2;
-  return xQueueSend(msgOutQ, msg, 0) == pdTRUE;
-}
-
-void applyKeyEvent(const uint8_t command, const uint8_t octaveValue, const uint8_t key){
-  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-  sysState.RX_Message[0] = command;
-  sysState.RX_Message[1] = octaveValue;
-  sysState.RX_Message[2] = key;
-  xSemaphoreGive(sysState.mutex);
-  if(command == 'P'){
-    for(int i = 0; i<kNumVoices; i++){
-      if(voices[i].active){
-        continue;
-      }else{
-        voices[i].octave = octaveValue;
-        voices[i].key = key;
-        voices[i].phase = 0;
-        voices[i].step = static_cast<uint32_t>(
-          (static_cast<double>(frequencies[key]) *
-           pow(2.0, static_cast<double>(static_cast<int>(octaveValue) - 4)) *
-           4294967296.0) / sampling_frequency
-        );
-        voices[i].active = true;
-        break;
-      }
-    }
-  }else if(command == 'R'){
-    for(int i = 0; i<kNumVoices; i++){
-      if(voices[i].active && voices[i].octave == octaveValue && voices[i].key == key){
-        voices[i].active = false;
-        break;
-      }
-    }
-  }
-}
-
-void applyControlEvent(const uint8_t command, const uint8_t value){
-  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-  sysState.RX_Message[0] = command;
-  sysState.RX_Message[1] = value;
-  sysState.RX_Message[2] = 0;
-  xSemaphoreGive(sysState.mutex);
-
-  if(command == 'V'){
-    knob3Rotation = (value <= 8) ? value : 8;
-  }else if(command == 'W'){
-    knob2Rotation = value & 0x03;
-    updateWaveformFromKnob(knob2Rotation);
-  }
-}
-
-void sampleISR(){
-  static int32_t phaseAcc = 0;
-  phaseAcc = 0;
-  uint8_t count = 0;
-
-  if(currentWaveform == SINE){
-    for(int i = 0; i<kNumVoices; i++){
-      if(voices[i].active){
-        int32_t sample = sineLUT[voices[i].phase >> 20];
-        phaseAcc += sample >> (8-knob3Rotation);
-        voices[i].phase += voices[i].step;
-        count++;
-      }
-    }
-  }else if(currentWaveform == SAWTOOTH){
-    for(int i = 0; i<kNumVoices; i++){
-      if(voices[i].active){
-        int32_t sample = static_cast<int32_t>(voices[i].phase - 0x80000000u);
-        phaseAcc += sample >> (2+(8-knob3Rotation));
-        voices[i].phase += voices[i].step;
-        count++;
-      }
-    }
-  }else if(currentWaveform == SQUARE){
-    for(int i = 0; i<kNumVoices; i++){
-      if(voices[i].active){
-        int32_t sample = (voices[i].phase & 0x80000000u) ? 2147483647 : -2147483647;
-        phaseAcc += sample >> (2+(8-knob3Rotation));
-        voices[i].phase += voices[i].step;
-        count++;
-      }
-    }
-  }else if(currentWaveform == TRIANGLE){
-    for(int i = 0; i<kNumVoices; i++){
-      if(voices[i].active){
-        uint32_t ramp = voices[i].phase >> 15; // 17-bit ramp [0..131071]
-        uint32_t tri = (ramp & 0x10000u) ? (0x1FFFFu - ramp) : ramp; // Fold into triangle
-        int32_t sample = (static_cast<int32_t>(tri) << 16) - 2147483647;
-        phaseAcc += sample >> (2+(8-knob3Rotation));
-        voices[i].phase += voices[i].step;
-        count++;
-      }
-    }
-  }
-
-  if(count != 0){  
-    int32_t Vout = (phaseAcc >> 24);
-    //Vout = Vout >> (8-knob3Rotation); //Apply volume control
-    analogWrite(OUTR_PIN, Vout + 128);
-  }
-
-}
-
-void CAN_RX_ISR (void) {
-  uint8_t RX_Message_ISR[8];
-  uint32_t ID;
-  CAN_RX(ID, RX_Message_ISR);
-
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  xQueueSendFromISR(msgInQ, RX_Message_ISR, &xHigherPriorityTaskWoken);
-  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-
-void CAN_TX_ISR (void) {
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	BaseType_t ok = xSemaphoreGiveFromISR(CAN_TX_Semaphore, &xHigherPriorityTaskWoken);
-	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-void scanKeysTask(void * pvParameters){
-  static uint32_t next = millis();
-  static uint32_t count = 0;
-  const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
-  static std::bitset<32> inputs;
-  static std::bitset<32> old_inputs;
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  
-  while(true){
+
+  while (1) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    // ✅ 1) 先在锁内拷贝一份 inputs
+    std::bitset<32> inputsCopy;
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    old_inputs = sysState.inputs;
-    for(int i = 0; i<8; i++){
-      setRow(i);
-      delayMicroseconds(10);
-      std::bitset<4> col = readCols();
-      for(int j = 0; j<4; j++){
-        inputs[i*4+j] = col[j];
-      }
-    }
-    sysState.inputs = inputs;
+    inputsCopy = sysState.inputs;
     xSemaphoreGive(sysState.mutex);
+    // display
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+
+
+    // show inputs (12-bit hex)
+    u8g2.setCursor(0, 20);
+    u8g2.print((unsigned long)(inputsCopy.to_ulong() & 0xFFF), HEX);
+
+    // show selected note name
+    int selectedKey = -1;
+    for (int i = 0; i < 12; i++) {
+      if (sysState.inputs[i] == 0) selectedKey = i;
+    }
+
+    u8g2.setCursor(0, 30);
+    u8g2.print("Note=");
+    if (selectedKey >= 0) u8g2.print(noteNames[selectedKey]);
+    else u8g2.print("--");
+
+
+    int knobCopy;
+
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    knobCopy = sysState.knob3Rotation;
+    xSemaphoreGive(sysState.mutex);
+
+    u8g2.setCursor(95, 30);
+    u8g2.print("Vol=");
+    u8g2.print(knobCopy);
+
+
+    int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
+    u8g2.setCursor(90, 10);
+    u8g2.print("OCT=");
+    u8g2.print((int)os);
+
     
-    std::bitset<32> changed = inputs ^ old_inputs;
-    for(int i = 0; i<12; i++){
-      if(changed[i]){
-        if(!inputs[i]){
-          Serial.print("Pushed: ");
-          Serial.println(i);
-          TX_Message[0] = 'P';
-          TX_Message[1] = octave;
-          TX_Message[2] = i;
-          applyKeyEvent('P', octave, i);
-        }else{
-          Serial.print("Released: ");
-          Serial.println(i);
-          TX_Message[0] = 'R';
-          TX_Message[1] = octave;
-          TX_Message[2] = i;
-          applyKeyEvent('R', octave, i);
-        }
-        uint8_t* msg_ptr = (uint8_t*) TX_Message;
-        xQueueSend(msgOutQ, msg_ptr, 0);
-      }
-    }
-    vTaskDelayUntil( &xLastWakeTime, xFrequency );
-  }
-}
+    uint16_t jy = __atomic_load_n(&joyYRaw, __ATOMIC_RELAXED);
 
-void displayKeysTask(void * pvParameters){
-  const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  while(true){
-    u8g2.clearBuffer();         // clear the internal memory
-    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-    u8g2.setCursor(2,10);
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    u8g2.print((char) sysState.RX_Message[0]);
-    u8g2.print(sysState.RX_Message[1]);
-    u8g2.print(sysState.RX_Message[2]);
-    xSemaphoreGive(sysState.mutex);
+    u8g2.setCursor(50, 20);
+    u8g2.print("JY=");
+    u8g2.print(jy);
 
-    u8g2.setCursor(50,10);
-    u8g2.print(wave2String(currentWaveform).c_str());
+    uint8_t jm = __atomic_load_n(&joyMode, __ATOMIC_RELAXED);
+    u8g2.setCursor(50, 30);
+    u8g2.print(jm ? "PORT" : "VIB ");
 
-    u8g2.setCursor(2,20);
-    std::string key_states = "";
-    std::string volume_str;
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    for(int i = 0; i<12; i++){
-      key_states += ' ';
-      key_states += (sysState.inputs[i] ? '1' : '0');
-    }
-    xSemaphoreGive(sysState.mutex);
-    u8g2.print(key_states.c_str());
+    
+    u8g2.setCursor(100, 20);
+    u8g2.print((char)RX_Message[0]);
+    u8g2.print(RX_Message[1]);
+    u8g2.print(RX_Message[2]);
 
-    u8g2.setCursor(2,30);
-    u8g2.print("Oct: ");
-    u8g2.print(octave);
+    
+    // ---- Show waveform / duty / tone ----
+    u8g2.setCursor(0, 10);   // 你原来(0,10)在写Hello World，这里你也可以换位置
+    // 如果不想覆盖 Hello World，就用别的位置，比如 (2, 10) 之前你写了 drawStr
+    // 建议用 (2, 10) 这行放 Wave 信息，把 Hello World 去掉更清爽
 
-    u8g2.setCursor(50,30);
-    volume_str = "Volume: " + std::to_string(knob3Rotation);
-    u8g2.print(volume_str.c_str());
-    xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    u8g2.sendBuffer();          // transfer internal memory to the display
-    xSemaphoreGive(i2cMutex);
+    uint8_t m = __atomic_load_n(&waveSel, __ATOMIC_RELAXED);
+    uint8_t t = __atomic_load_n(&toneK, __ATOMIC_RELAXED);
 
-    //Toggle LED
+    ///// u8g2.print("W=");
+    if (m == W_SAW) u8g2.print("SAWTOOTH");
+    else if (m == W_SQUARE) u8g2.print("SQUARE");
+    else if (m == W_TRI) u8g2.print("TRIANGLE");
+    else if (m == W_SINE) u8g2.print("SINE");
+    else if (m == W_SAW_SINE) u8g2.print("SAW+SIN");
+    else if (m == W_SQUARE_SINE) u8g2.print("SQR+SIN");
+    else if (m == W_DETUNE_SAW) u8g2.print("detSAW");
+    else if (m == W_DETUNE_SQUARE) u8g2.print("detSQR");
+    else if (m == W_SUPER_SAW) u8g2.print("SUPERSAW");
+    else u8g2.print("RES");
+
+
+    u8g2.print(" T=");
+    u8g2.print(t);
+
+    u8g2.sendBuffer();
+
+    // LED toggle (讲义要求保留)
     digitalToggle(LED_BUILTIN);
-    vTaskDelayUntil( &xLastWakeTime, xFrequency );
   }
 }
 
-void knobTask(void * pvParameters){
-  uint8_t prev = 0xFF;
-  while(true){
-    const uint8_t oldKnob3Rotation = knob3Rotation;
-    const uint8_t oldKnob2Rotation = knob2Rotation;
+void CAN_RX_ISR(void) {
+    uint8_t rx_isr[8];
+    uint32_t ID;
 
-    xSemaphoreTake(knobIntSem, portMAX_DELAY);
-    xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    uint8_t now = pcalReadInputs();
-    xSemaphoreGive(i2cMutex);
+    CAN_RX(ID, rx_isr);
+    xQueueSendFromISR(msgInQ, rx_isr, NULL);
+}
 
-    uint8_t prevAB3 = (prev >> 6) & 0x03;
-    uint8_t nowAB3 = (now >> 6) & 0x03;
-    uint8_t t3 = (prevAB3 << 2) | nowAB3;
-    if ((t3 == 0b0001 || t3 == 0b1110) && knob3Rotation < 8) knob3Rotation++;
-    if ((t3 == 0b1011 || t3 == 0b0100) && knob3Rotation > 0) knob3Rotation--;
+void CAN_TX_ISR(void) {
+  xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+}
 
-    uint8_t prevAB2 = (prev >> 4) & 0x03;
-    uint8_t nowAB2 = (now >> 4) & 0x03;
-    uint8_t t2 = (prevAB2 << 2) | nowAB2;
-    if (t2 == 0b0001 || t2 == 0b1110) {
-      knob2Rotation = (knob2Rotation < 3) ? (knob2Rotation + 1) : 0;
-    }
-    if (t2 == 0b1011 || t2 == 0b0100) {
-      knob2Rotation = (knob2Rotation > 0) ? (knob2Rotation - 1) : 3;
-    }
+void CAN_TX_Task(void *pvParameters) {
+  uint8_t msgOut[8];
 
-    uint8_t prevAB1 = (prev >> 2) & 0x03;
-    uint8_t nowAB1 = (now >> 2) & 0x03;
-    uint8_t t1 = (prevAB1 << 2) | nowAB1;
-    if ((t1 == 0b0001 || t1 == 0b1110) && knob1Rotation < 8) knob1Rotation++;
-    if ((t1 == 0b1011 || t1 == 0b0100) && knob1Rotation > 0) knob1Rotation--;
-
-    switch (knob2Rotation) {
-      case 0: currentWaveform = SAWTOOTH; break;
-      case 1: currentWaveform = SINE;     break;
-      case 2: currentWaveform = SQUARE;   break;
-      case 3: currentWaveform = TRIANGLE; break;
-    }
-    octave = knob1Rotation;
-
-    if (knob3Rotation != oldKnob3Rotation) {
-      applyControlEvent('V', knob3Rotation);
-      queueCANCommand('V', knob3Rotation, 0);
-    }
-    if (knob2Rotation != oldKnob2Rotation) {
-      applyControlEvent('W', knob2Rotation);
-      queueCANCommand('W', knob2Rotation, 0);
-    }
-
-    prev = now;
+  while (1) {
+    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+    xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+    CAN_TX(0x123, msgOut);
   }
 }
 
-void decodeTask(void * pvParameters){
-  uint8_t RX_Message[8] = {0};
-  while(true){
-    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
-    uint8_t command = RX_Message[0];
-    if(command == 'P' || command == 'R'){
-      uint8_t octave = RX_Message[1];
-      uint8_t key = RX_Message[2];
-      applyKeyEvent(command, octave, key);
-    }else if(command == 'V' || command == 'W'){
-      applyControlEvent(command, RX_Message[1]);
+void decodeTask(void *pvParameters) {
+    uint8_t localMsg[8];
+
+    while (1) {
+        xQueueReceive(msgInQ, localMsg, portMAX_DELAY);
+
+        // 拷贝到全局 RX_Message（简单版，先不加 mutex）
+        for (int i = 0; i < 8; i++) {
+            RX_Message[i] = localMsg[i];
+        }
+
+        // 播放音符逻辑
+        char type = (char)localMsg[0];
+        uint8_t octave = localMsg[1];
+        uint8_t note = localMsg[2];
+
+        uint32_t step = 0;
+
+        if (type == 'P') {
+            step = stepSizes[note];
+            // ✅ apply octave shift (same as scanKeysTask)
+            int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
+            if (step != 0) {
+              if (os > 0) step <<= os;
+              else if (os < 0) step >>= (-os);
+            }
+            if (octave > 4)
+                step <<= (octave - 4);
+            else if (octave < 4)
+                step >>= (4 - octave);
+        }
+        else if (type == 'R') {
+            step = 0;
+        }
+
+        /// __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
     }
-  }
 }
-
-void CAN_TX_Task(void * pvParameters){
-	uint8_t msgOut[8];
-  const TickType_t txSemaphoreTimeout = pdMS_TO_TICKS(20);
-	while (true) {
-		xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
-		xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
-		CAN_TX(SEND_ID, msgOut);
-	}
-}
-
-
 
 void setup() {
   // put your setup code here, to run once:
-  msgInQ = xQueueCreate(36,8);
-  msgOutQ = xQueueCreate(36,8);
   sysState.mutex = xSemaphoreCreateMutex();
+  sysState.knob3Rotation = 8;   // 默认最大音量
+  initSineTable();
 
   //Set pin directions
   pinMode(RA0_PIN, OUTPUT);
@@ -510,40 +869,16 @@ void setup() {
   setOutMuxBit(DRST_BIT, HIGH);  //Release display logic reset
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
-  setOutMuxBit(KNOB_MODE, LOW);  //Read knobs through I2C expander
+  setOutMuxBit(KNOB_MODE, HIGH);  //Read knobs through key matrix
 
-  setOutMuxBit(ALL_BITS, HIGH);  //Enable headphone output
-  digitalWrite(REN_PIN, HIGH);
-  
   //Initialise UART
-  Serial.begin(115200);
+  Serial.begin(9600);
+  Serial.println("Hello World");
 
-  for (int i = 0; i < 4096; i++) {
-    double phase = (2.0 * PI * static_cast<double>(i)) / 4096;
-    double s = sin(phase);
-    double value = 2147483647.0 * s;
-    sineLUT[i] = static_cast<int32_t>(value);
-  }
-
-  // NCO tuning: A (index 9) = 440 Hz, fs = 22 kHz
-  // constexpr double sampleRate = 22000.0;
-  // constexpr double semitone = 1.0594630943592953; // 2^(1/12)
-  // constexpr double ncoScale = 4294967296.0 / sampleRate; // 2^32 / fs
-  // double freq = 440.0 * pow(semitone, -9.0); // index 0 is C
-  // for (int i = 0; i < 12; i++) {
-  //   stepSizes[i] = static_cast<uint32_t>(freq * ncoScale);
-  //   freq *= semitone;
-  // }
-
-  constexpr double c4Hz = 261.6255653005986; // Middle C (C4)
-  for (int i = 0; i < 12; i++) {
-    frequencies[i] = c4Hz * pow(2.0, static_cast<double>(i) / 12.0);
-  }
-
-  sampleTimer.setOverflow(sampling_frequency, HERTZ_FORMAT);
+  //Timer setup
+  sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
-  CAN_TX_Semaphore = xSemaphoreCreateCounting(3,3);
 
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(
@@ -551,51 +886,49 @@ void setup() {
   "scanKeys",		/* Text name for the task */
   256,      		/* Stack size in words, not bytes */
   NULL,			/* Parameter passed into the task */
-  1,			/* Task priority */
-  &scanKeysHandle );	/* Pointer to store the task handle */
-
-  TaskHandle_t displayKeysHandle = NULL;
-  xTaskCreate(
-  displayKeysTask,		/* Function that implements the task */
-  "displayKeys",		/* Text name for the task */
-  256,      		/* Stack size in words, not bytes */
-  NULL,			/* Parameter passed into the task */
   2,			/* Task priority */
-  &displayKeysHandle );	/* Pointer to store the task handle */
-
-  TaskHandle_t decodeHandle = NULL;
+  &scanKeysHandle );	/* Pointer to store the task handle */
+  TaskHandle_t displayHandle = NULL;
   xTaskCreate(
-  decodeTask,		/* Function that implements the task */
-  "decode",		/* Text name for the task */
-  256,      		/* Stack size in words, not bytes */
-  NULL,			/* Parameter passed into the task */
-  1,			/* Task priority */
-  &decodeHandle );	/* Pointer to store the task handle */
+    displayUpdateTask,
+    "display",
+    1024,       // stack words
+    NULL,
+    1,         // lower priority
+    &displayHandle
+  );
 
-  TaskHandle_t CANTXHandle = NULL;
-  xTaskCreate(CAN_TX_Task,"CAN_TX",256,NULL,1,&CANTXHandle );	
-  TaskHandle_t knobHandle = NULL;
-  xTaskCreate(knobTask,"knob",64,NULL,1,&knobHandle );
+  xTaskCreate(
+    decodeTask,
+    "decode",
+    256,
+    NULL,
+    2,
+    NULL
+  );
+  
+  xTaskCreate(
+    CAN_TX_Task,
+    "canTX",
+    256,
+    NULL,
+    3,     // 比 scanKeys 高一点也可以
+    NULL
+  );
 
-  Wire.begin();
-  i2cMutex = xSemaphoreCreateMutex();
-  knobIntSem = xSemaphoreCreateBinary();
-  xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  pcalWriteReg(0x03, 0xFF);
-  pcalWriteReg(0x43, 0xFF);
-  pcalWriteReg(0x44, 0xFF);
-  pcalWriteReg(0x42, 0xFF);
-  pcalWriteReg(0x45, 0x00);
-  (void)pcalReadInputs();
-  xSemaphoreGive(i2cMutex);
-  pinMode(KNOB_INT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(KNOB_INT_PIN), knobIntISR, LOW);
-
-  CAN_Init(false);
-  setCANFilter(RECEIVE_ID,0x7ff);
+  CAN_Init(true);          // true=loopback
+  setCANFilter(0x123, 0x7ff);
+  msgInQ = xQueueCreate(36, 8);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
+  msgOutQ = xQueueCreate(36, 8);
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
+
+  sysState.knob3Rotation = 8;  // volume 默认最大（你原来）
+  sysState.knob0Rotation = 0;  // wave 默认 saw
+  sysState.knob1Rotation = 4;  // duty 默认中间
+  sysState.knob2Rotation = 0;  // tone 默认最亮/不过滤
 
 
   vTaskStartScheduler();
@@ -603,5 +936,4 @@ void setup() {
 
 void loop() {
 
-  // put your main code here, to run repeatedly:
 }
