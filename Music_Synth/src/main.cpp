@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <bitset>
+#include <cstddef>
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
 
@@ -47,6 +48,7 @@ QueueHandle_t msgInQ;
 volatile uint8_t RX_Message[8] = {0};
 QueueHandle_t msgOutQ;
 SemaphoreHandle_t CAN_TX_Semaphore;
+SemaphoreHandle_t recordMutex;
 uint32_t SEND_ID = 0x123;
 uint32_t RECEIVE_ID = 0x123;
 
@@ -112,19 +114,206 @@ volatile uint8_t toneK     = 0;       // 0..8 (滤波强度/闷度)
 volatile int8_t octaveShift = 0;  // 以 1 为单位：+1=上移一八度，-1=下移一八度
 volatile uint16_t joyXRaw = 520;
 volatile uint8_t joyMode = 0;     // 0=vibrato, 1=portamento
-volatile uint16_t remotePressedMask = 0; // bit i = remote key i pressed
+volatile uint8_t knob3Rotation = 7; // volume 0..8
+volatile uint8_t knob2Rotation = 0; // tone/filter 0..8
+volatile uint8_t knob1Rotation = 4; // duty 0..8
+volatile uint8_t knob0Rotation = 0; // wave select 0..8
+volatile uint16_t localPressedMaskByOct[8] = {0};  // local key states by octave
+volatile uint16_t remotePressedMaskByOct[8] = {0}; // bit i = remote key i pressed at octave index
 // （你已有 joyXRaw）
 
 const char* noteNames[12] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
 };
 
+constexpr uint8_t INPUT_KNOB2S = 20;
+constexpr uint8_t INPUT_KNOB3S = 21;
+constexpr size_t MAX_RECORDED_EVENTS = 1024;
+
+enum RecordSource : uint8_t {
+  RECORD_FROM_TX = 0,
+  RECORD_FROM_RX = 1
+};
+
+struct RecordedCanEvent {
+  uint32_t relTimeMs;
+  uint8_t msg[3];
+  uint8_t source;
+};
+
+RecordedCanEvent recordedEvents[MAX_RECORDED_EVENTS];
+size_t recordedEventCount = 0;
+size_t playbackEventIndex = 0;
+volatile bool isRecording = false;
+volatile bool isPlayingBack = false;
+volatile uint32_t recordStartMs = 0;
+volatile uint32_t playbackStartMs = 0;
+
+static inline void applyKeyEvent(volatile uint16_t *maskByOct, const uint8_t command, const uint8_t octave, const uint8_t key);
+bool queueCANCommand(const uint8_t command, const uint8_t arg1, const uint8_t arg2);
+
+static inline void handleCommandMessage(const uint8_t *msg) {
+  char type = (char)msg[0];
+  if (type == 'P' || type == 'R') {
+    applyKeyEvent(remotePressedMaskByOct, msg[0], msg[1], msg[2]);
+  } else if (type == 'V') {
+    uint8_t v = msg[1];
+    if (v > 8) v = 8;
+    __atomic_store_n(&knob3Rotation, v, __ATOMIC_RELAXED);
+  } else if (type == 'W') {
+    uint8_t t = msg[1];
+    if (t > 8) t = 8;
+    __atomic_store_n(&knob2Rotation, t, __ATOMIC_RELAXED);
+    __atomic_store_n(&toneK, t, __ATOMIC_RELAXED);
+  } else if (type == 'D') {
+    uint8_t d = msg[1];
+    if (d > 8) d = 8;
+    __atomic_store_n(&knob1Rotation, d, __ATOMIC_RELAXED);
+  } else if (type == 'M') {
+    uint8_t m = msg[1];
+    if (m > 8) m = 8;
+    __atomic_store_n(&knob0Rotation, m, __ATOMIC_RELAXED);
+    __atomic_store_n(&waveSel, m, __ATOMIC_RELAXED);
+  } else if (type == 'J') {
+    uint8_t jm = msg[1] & 0x01;
+    __atomic_store_n(&joyMode, jm, __ATOMIC_RELAXED);
+  }
+}
+
+static void recordCanEvent(const uint8_t *msg, const RecordSource source) {
+  if (!recordMutex) return;
+
+  xSemaphoreTake(recordMutex, portMAX_DELAY);
+  if (isRecording && !isPlayingBack && recordedEventCount < MAX_RECORDED_EVENTS) {
+    RecordedCanEvent &evt = recordedEvents[recordedEventCount++];
+    evt.relTimeMs = millis() - recordStartMs;
+    evt.msg[0] = msg[0];
+    evt.msg[1] = msg[1];
+    evt.msg[2] = msg[2];
+    evt.source = (uint8_t)source;
+  }
+  xSemaphoreGive(recordMutex);
+}
+
+static void startRecordingSession() {
+  xSemaphoreTake(recordMutex, portMAX_DELAY);
+  bool wasPlaying = isPlayingBack;
+  recordedEventCount = 0;
+  playbackEventIndex = 0;
+  recordStartMs = millis();
+  isPlayingBack = false;
+  isRecording = true;
+  xSemaphoreGive(recordMutex);
+
+  if (wasPlaying) {
+    for (uint8_t oct = 0; oct < 8; oct++) {
+      __atomic_store_n(&remotePressedMaskByOct[oct], 0, __ATOMIC_RELAXED);
+    }
+    Serial.println("[PLAYBACK STOP] reason=recording_started");
+  }
+}
+
+static void stopRecordingSession() {
+  xSemaphoreTake(recordMutex, portMAX_DELAY);
+  isRecording = false;
+  xSemaphoreGive(recordMutex);
+}
+
+static void stopPlaybackSession(const char *reason) {
+  xSemaphoreTake(recordMutex, portMAX_DELAY);
+  uint32_t elapsed = millis() - playbackStartMs;
+  size_t idx = playbackEventIndex;
+  size_t total = recordedEventCount;
+  isPlayingBack = false;
+  playbackEventIndex = 0;
+  for (uint8_t oct = 0; oct < 8; oct++) {
+    __atomic_store_n(&remotePressedMaskByOct[oct], 0, __ATOMIC_RELAXED);
+  }
+  xSemaphoreGive(recordMutex);
+
+  Serial.print("[PLAYBACK STOP] reason=");
+  Serial.print(reason);
+  Serial.print(" elapsed_ms=");
+  Serial.print((unsigned long)elapsed);
+  Serial.print(" idx=");
+  Serial.print((unsigned long)idx);
+  Serial.print("/");
+  Serial.println((unsigned long)total);
+}
+
+static bool startPlaybackSession() {
+  bool started = false;
+  size_t total = 0;
+  xSemaphoreTake(recordMutex, portMAX_DELAY);
+  total = recordedEventCount;
+  if (!isRecording && recordedEventCount > 0) {
+    isPlayingBack = true;
+    playbackEventIndex = 0;
+    playbackStartMs = millis();
+    started = true;
+  }
+  xSemaphoreGive(recordMutex);
+  if (started) {
+    Serial.print("[PLAYBACK START] events=");
+    Serial.println((unsigned long)total);
+  } else {
+    Serial.print("[PLAYBACK NOT STARTED] isRecording=");
+    Serial.print((int)__atomic_load_n(&isRecording, __ATOMIC_RELAXED));
+    Serial.print(" events=");
+    Serial.println((unsigned long)total);
+  }
+  return started;
+}
+
+static void processPlaybackEvents() {
+  if (!recordMutex) return;
+
+  while (true) {
+    RecordedCanEvent evt;
+    bool hasDueEvent = false;
+    bool done = false;
+    bool playbackFinished = false;
+
+    xSemaphoreTake(recordMutex, portMAX_DELAY);
+    if (!isPlayingBack) {
+      xSemaphoreGive(recordMutex);
+      return;
+    }
+
+    uint32_t elapsed = millis() - playbackStartMs;
+    if (playbackEventIndex < recordedEventCount &&
+        recordedEvents[playbackEventIndex].relTimeMs <= elapsed) {
+      evt = recordedEvents[playbackEventIndex++];
+      hasDueEvent = true;
+    } else if (playbackEventIndex >= recordedEventCount) {
+      playbackFinished = true;
+      done = true;
+    }
+    xSemaphoreGive(recordMutex);
+
+    if (done) {
+      if (playbackFinished) {
+        stopPlaybackSession("sequence_end");
+      }
+      return;
+    }
+    if (!hasDueEvent) return;
+
+    handleCommandMessage(evt.msg);
+    queueCANCommand(evt.msg[0], evt.msg[1], evt.msg[2]);
+  }
+}
+
 bool queueCANCommand(const uint8_t command, const uint8_t arg1, const uint8_t arg2) {
   uint8_t msg[8] = {0};
   msg[0] = command;
   msg[1] = arg1;
   msg[2] = arg2;
-  return xQueueSend(msgOutQ, msg, 0) == pdTRUE;
+  bool queued = (xQueueSend(msgOutQ, msg, 0) == pdTRUE);
+  if (queued) {
+    recordCanEvent(msg, RECORD_FROM_TX);
+  }
+  return queued;
 }
 
 std::bitset<4> readCols() {
@@ -155,10 +344,6 @@ constexpr double TWO32 = 4294967296.0; // 2^32
 
 struct {
     std::bitset<32> inputs;
-    int knob3Rotation;   // ✅ 你原来的：音量
-    int knob0Rotation;   // 波形选择
-    int knob1Rotation;   // 
-    int knob2Rotation;   // tone/filter
     SemaphoreHandle_t mutex;
 } sysState;
 
@@ -261,20 +446,6 @@ void initSineTable() {
     }
 };
 
-static inline int8_t quadDelta(uint8_t prev, uint8_t curr, bool invert) {
-  // index = prev*4 + curr
-  // Table gives +1/-1 for valid quadrature steps, 0 otherwise (bounce/invalid)
-  static const int8_t table[16] = {
-    0, -1, +1,  0,
-    +1, 0,  0, -1,
-    -1, 0,  0, +1,
-     0, +1, -1, 0
-  };
-
-  int8_t d = table[(prev << 2) | curr];
-  return invert ? -d : d;
-}
-
 static inline int16_t clamp8(int16_t s){
   if (s > 127) return 127;
   if (s < -128) return -128;
@@ -287,46 +458,31 @@ static inline int16_t softClip8(int16_t s) {
   return (s * 128) / denom;
 }
 
-static inline void updateEncoderOnMatrixRowFullStep(
-  uint8_t row, uint8_t colB, uint8_t colA,
-  uint8_t &prevState,
-  int8_t  &acc,                 // ✅ 新增：累计器
-  int &value, int vmin, int vmax,
-  bool invertDirection
-){
-  setRow(row);
-  delayMicroseconds(3);
-  std::bitset<4> cols = readCols();
-
-  uint8_t currState = (uint8_t)((cols[colB] << 1) | cols[colA]);
-  int8_t d = quadDelta(prevState, currState, invertDirection);
-  prevState = currState;
-
-  if (d != 0) {
-    acc += d;
-
-    // ✅ 方案B：满 4 个有效边沿才算 1 格（完成一整步）
-    if (acc >= 4)  { value += 1; acc = 0; }
-    if (acc <= -4) { value -= 1; acc = 0; }
-
-    if (value > vmax) value = vmax;
-    if (value < vmin) value = vmin;
+static inline void applyKeyEvent(volatile uint16_t *maskByOct, const uint8_t command, const uint8_t octave, const uint8_t key) {
+  if (octave >= 8 || key >= 12) return;
+  uint16_t bit = (uint16_t)(1u << key);
+  uint16_t mask = __atomic_load_n(&maskByOct[octave], __ATOMIC_RELAXED);
+  if (command == 'P') {
+    mask |= bit;
+  } else if (command == 'R') {
+    mask &= (uint16_t)(~bit);
+  } else {
+    return;
   }
+  __atomic_store_n(&maskByOct[octave], mask, __ATOMIC_RELAXED);
 }
-
 
 void scanKeysTask(void * pvParameters) {
 
-  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  const bool INVERT_ALL_KNOBS = true;
 
   std::bitset<12> prevKeys;
   prevKeys.set();   // 未按=1，按下=0
 
-  // 每个旋钮一个 prevState（放外面，保持状态）
-  static uint8_t prevK3 = 0, prevK2 = 0, prevK1 = 0, prevK0 = 0;
-  static int8_t accK3 = 0, accK2 = 0, accK1 = 0, accK0 = 0;
+  static std::bitset<32> prevInputs;
+  static bool prevInputsValid = false;
+  static uint8_t localKeyOctave[12] = {4,4,4,4,4,4,4,4,4,4,4,4};
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -362,42 +518,101 @@ void scanKeysTask(void * pvParameters) {
     }
     lastJoyPressed = joyPressed;
 
+    // ---- record / playback button handling ----
+    std::bitset<32> changedInputs;
+    changedInputs.reset();
+    if (prevInputsValid) {
+      changedInputs = localInputs ^ prevInputs;
+    }
+
+    bool playbackWasActive = __atomic_load_n(&isPlayingBack, __ATOMIC_RELAXED);
+    bool playbackKeyPressedEdge = prevInputsValid &&
+      changedInputs[INPUT_KNOB3S] &&
+      (localInputs[INPUT_KNOB3S] == 0);
+
+    if (prevInputsValid && playbackWasActive && playbackKeyPressedEdge) {
+      stopPlaybackSession("playback_key_pressed");
+    }
+
+    if (prevInputsValid && changedInputs[INPUT_KNOB2S] && (localInputs[INPUT_KNOB2S] == 0)) {
+      bool recNow = __atomic_load_n(&isRecording, __ATOMIC_RELAXED);
+      if (recNow) {
+        stopRecordingSession();
+      } else {
+        startRecordingSession();
+      }
+    }
+
+    if (prevInputsValid && playbackKeyPressedEdge && !playbackWasActive) {
+      startPlaybackSession();
+    }
+
     // ---- compare + send CAN ----
     for (int k = 0; k < 12; k++) {
       bool prev = prevKeys[k];
       bool curr = localInputs[k];
 
       if (prev != curr) {
-        queueCANCommand((curr == 0) ? 'P' : 'R', 4, (uint8_t)k);
+        if (curr == 0) {
+          int8_t osForTx = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
+          uint8_t octaveForTx = (uint8_t)(4 + osForTx); // transmit real current octave
+          localKeyOctave[k] = octaveForTx;
+          applyKeyEvent(localPressedMaskByOct, 'P', octaveForTx, (uint8_t)k);
+          queueCANCommand('P', octaveForTx, (uint8_t)k);
+        } else {
+          applyKeyEvent(localPressedMaskByOct, 'R', localKeyOctave[k], (uint8_t)k);
+          queueCANCommand('R', localKeyOctave[k], (uint8_t)k);
+        }
       }
     }
 
     for (int k = 0; k < 12; k++) prevKeys[k] = localInputs[k];
 
     // ---- knobs (统一方向) ----
-    int k3, k2, k1, k0;
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    k3 = sysState.knob3Rotation;   // volume
-    k2 = sysState.knob2Rotation;   // tone
-    k1 = sysState.knob1Rotation;   // duty
-    k0 = sysState.knob0Rotation;   // wave
-    xSemaphoreGive(sysState.mutex);
+    int k3 = (int)__atomic_load_n(&knob3Rotation, __ATOMIC_RELAXED);   // volume
+    int k2 = (int)__atomic_load_n(&knob2Rotation, __ATOMIC_RELAXED);   // tone
+    int k1 = (int)__atomic_load_n(&knob1Rotation, __ATOMIC_RELAXED);   // duty
+    int k0 = (int)__atomic_load_n(&knob0Rotation, __ATOMIC_RELAXED);   // wave
 
     int oldK3 = k3;
     int oldK2 = k2;
     int oldK1 = k1;
     int oldK0 = k0;
 
-    updateEncoderOnMatrixRowFullStep(3, 1, 0, prevK3, accK3, k3, 0, 8, INVERT_ALL_KNOBS);
-    updateEncoderOnMatrixRowFullStep(3, 3, 2, prevK2, accK2, k2, 0, 8, INVERT_ALL_KNOBS);
-    updateEncoderOnMatrixRowFullStep(4, 1, 0, prevK1, accK1, k1, 0, 8, INVERT_ALL_KNOBS);
-    updateEncoderOnMatrixRowFullStep(4, 3, 2, prevK0, accK0, k0, 0, 8, INVERT_ALL_KNOBS);
+    if (prevInputsValid) {
+      uint8_t prevAB3 = (static_cast<uint8_t>(prevInputs[12]) << 1) | static_cast<uint8_t>(prevInputs[13]);
+      uint8_t nowAB3 = (static_cast<uint8_t>(localInputs[12]) << 1) | static_cast<uint8_t>(localInputs[13]);
+      uint8_t t3 = (prevAB3 << 2) | nowAB3;
+      if ((t3 == 0b0001 || t3 == 0b1110) && k3 > 0) k3--;
+      if ((t3 == 0b1011 || t3 == 0b0100) && k3 < 8) k3++;
 
+      uint8_t prevAB2 = (static_cast<uint8_t>(prevInputs[14]) << 1) | static_cast<uint8_t>(prevInputs[15]);
+      uint8_t nowAB2 = (static_cast<uint8_t>(localInputs[14]) << 1) | static_cast<uint8_t>(localInputs[15]);
+      uint8_t t2 = (prevAB2 << 2) | nowAB2;
+      if ((t2 == 0b0001 || t2 == 0b1110) && k2 > 0) k2--;
+      if ((t2 == 0b1011 || t2 == 0b0100) && k2 < 8) k2++;
+
+      uint8_t prevAB1 = (static_cast<uint8_t>(prevInputs[16]) << 1) | static_cast<uint8_t>(prevInputs[17]);
+      uint8_t nowAB1 = (static_cast<uint8_t>(localInputs[16]) << 1) | static_cast<uint8_t>(localInputs[17]);
+      uint8_t t1 = (prevAB1 << 2) | nowAB1;
+      if ((t1 == 0b0001 || t1 == 0b1110) && k1 > 0) k1--;
+      if ((t1 == 0b1011 || t1 == 0b0100) && k1 < 8) k1++;
+
+      uint8_t prevAB0 = (static_cast<uint8_t>(prevInputs[18]) << 1) | static_cast<uint8_t>(prevInputs[19]);
+      uint8_t nowAB0 = (static_cast<uint8_t>(localInputs[18]) << 1) | static_cast<uint8_t>(localInputs[19]);
+      uint8_t t0 = (prevAB0 << 2) | nowAB0;
+      if ((t0 == 0b0001 || t0 == 0b1110) && k0 > 0) k0--;
+      if ((t0 == 0b1011 || t0 == 0b0100) && k0 < 8) k0++;
+    }
+
+    prevInputs = localInputs;
+    prevInputsValid = true;
+
+    __atomic_store_n(&knob3Rotation, (uint8_t)k3, __ATOMIC_RELAXED);
+    __atomic_store_n(&knob2Rotation, (uint8_t)k2, __ATOMIC_RELAXED);
+    __atomic_store_n(&knob1Rotation, (uint8_t)k1, __ATOMIC_RELAXED);
+    __atomic_store_n(&knob0Rotation, (uint8_t)k0, __ATOMIC_RELAXED);
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    sysState.knob3Rotation = k3;
-    sysState.knob2Rotation = k2;
-    sysState.knob1Rotation = k1;
-    sysState.knob0Rotation = k0;
     sysState.inputs = localInputs;
     xSemaphoreGive(sysState.mutex);
  
@@ -458,13 +673,11 @@ void scanKeysTask(void * pvParameters) {
       int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
       if (os > -3) os -= 1;   // 左：降八度
       __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
-      queueCANCommand('O', (uint8_t)(os + 3), 0);
     }
     if (joyState == 0 && newState == 2) {
       int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
       if (os < 3) os += 1;    // 右：升八度
       __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
-      queueCANCommand('O', (uint8_t)(os + 3), 0);
     }
 
     joyState = newState;
@@ -473,27 +686,31 @@ void scanKeysTask(void * pvParameters) {
     // ---- collect pressed keys -> voices (polyphony) ----
     uint32_t steps[NVOICE] = {0};
 
-    int8_t os = __atomic_load_n(&octaveShift, __ATOMIC_RELAXED);
-
     // 这里用“从左到右”取最多 NVOICE 个键，你也可以反过来
     int n = 0;
     int8_t mainNoteIdx = -1;
 
-    uint16_t remoteMask = __atomic_load_n(&remotePressedMask, __ATOMIC_RELAXED);
-    for (int i = 0; i < 12 && n < NVOICE; i++) {
-      bool localPressed = (localInputs[i] == 0);
-      bool remotePressed = ((remoteMask >> i) & 0x01u) != 0u;
-      if (localPressed || remotePressed) {
+    uint16_t combinedMasks[8];
+    for (uint8_t oct = 0; oct < 8; oct++) {
+      uint16_t localMask = __atomic_load_n(&localPressedMaskByOct[oct], __ATOMIC_RELAXED);
+      uint16_t remoteMask = __atomic_load_n(&remotePressedMaskByOct[oct], __ATOMIC_RELAXED);
+      combinedMasks[oct] = (uint16_t)(localMask | remoteMask);
+    }
+
+    for (uint8_t oct = 0; oct < 8 && n < NVOICE; oct++) {
+      uint16_t mask = combinedMasks[oct];
+      if (mask == 0) continue;
+
+      for (int i = 0; i < 12 && n < NVOICE; i++) {
+        if ((mask & (uint16_t)(1u << i)) == 0) continue;
+
         uint32_t st = stepSizes[i];
-        mainNoteIdx = (mainNoteIdx < 0) ? (int8_t)i : mainNoteIdx; // 第一个按下当主音
+        mainNoteIdx = (mainNoteIdx < 0) ? (int8_t)i : mainNoteIdx;
 
-        // octave shift
-        if (os > 0) st <<= os;
-        else if (os < 0) st >>= (-os);
+        if (oct > 4) st <<= (oct - 4);
+        else if (oct < 4) st >>= (4 - oct);
 
-        // pitch bend
         st = (uint32_t)((float)st * bendRatio);
-
         steps[n++] = st;
       }
     }
@@ -504,6 +721,8 @@ void scanKeysTask(void * pvParameters) {
     for (int v = 0; v < NVOICE; v++) {
       __atomic_store_n(&voices[v].step, steps[v], __ATOMIC_RELAXED);
     }
+
+    processPlaybackEvents();
   }
 }
 
@@ -673,10 +892,10 @@ void sampleISR() {
     return;
   }
 
-  mix /= activeCount;
-  // if (activeCount > 0) mix = mix;  // 不除
-
-  int16_t x = clamp8(mix);
+  int32_t mixScaled = (mix >> 2);
+  if (mixScaled > 127) mixScaled = 127;
+  if (mixScaled < -128) mixScaled = -128;
+  int16_t x = (int16_t)mixScaled;
 
   // master tone low-pass (your original)
   
@@ -692,8 +911,8 @@ void sampleISR() {
   } 
 
   // volume + clip
-  int volume = sysState.knob3Rotation;
-  x = (x * volume) / 8;
+  int volume = (int)__atomic_load_n(&knob3Rotation, __ATOMIC_RELAXED);
+  x = x >> (8-volume);
   x = softClip8(x);
 
   analogWrite(OUTR_PIN, (uint8_t)(x + 128));
@@ -745,11 +964,7 @@ void displayUpdateTask(void * pvParameters) {
     else u8g2.print("--");
 
 
-    int knobCopy;
-
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    knobCopy = sysState.knob3Rotation;
-    xSemaphoreGive(sysState.mutex);
+    int knobCopy = (int)__atomic_load_n(&knob3Rotation, __ATOMIC_RELAXED);
 
     u8g2.setCursor(95, 30);
     u8g2.print("Vol=");
@@ -761,12 +976,13 @@ void displayUpdateTask(void * pvParameters) {
     u8g2.print("OCT=");
     u8g2.print((int)os);
 
-    
-    uint16_t jy = __atomic_load_n(&joyYRaw, __ATOMIC_RELAXED);
+    bool recOn = __atomic_load_n(&isRecording, __ATOMIC_RELAXED);
+    bool playOn = __atomic_load_n(&isPlayingBack, __ATOMIC_RELAXED);
 
     u8g2.setCursor(50, 20);
-    u8g2.print("JY=");
-    u8g2.print(jy);
+    if (playOn) u8g2.print("PLAY");
+    else if (recOn) u8g2.print("REC ");
+    else u8g2.print("    ");
 
     uint8_t jm = __atomic_load_n(&joyMode, __ATOMIC_RELAXED);
     u8g2.setCursor(50, 30);
@@ -846,62 +1062,22 @@ void decodeTask(void *pvParameters) {
         for (int i = 0; i < 8; i++) {
             RX_Message[i] = localMsg[i];
         }
-
-        char type = (char)localMsg[0];
-        if (type == 'P' || type == 'R') {
-          uint8_t key = localMsg[2];
-          if (key < 12) {
-            uint16_t mask = __atomic_load_n(&remotePressedMask, __ATOMIC_RELAXED);
-            uint16_t bit = (uint16_t)(1u << key);
-            if (type == 'P') mask |= bit;
-            else mask &= (uint16_t)(~bit);
-            __atomic_store_n(&remotePressedMask, mask, __ATOMIC_RELAXED);
-          }
-        } else if (type == 'V') {
-          uint8_t v = localMsg[1];
-          if (v > 8) v = 8;
-          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-          sysState.knob3Rotation = v;
-          xSemaphoreGive(sysState.mutex);
-        } else if (type == 'W') {
-          uint8_t t = localMsg[1];
-          if (t > 8) t = 8;
-          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-          sysState.knob2Rotation = t;
-          xSemaphoreGive(sysState.mutex);
-          __atomic_store_n(&toneK, t, __ATOMIC_RELAXED);
-        } else if (type == 'D') {
-          uint8_t d = localMsg[1];
-          if (d > 8) d = 8;
-          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-          sysState.knob1Rotation = d;
-          xSemaphoreGive(sysState.mutex);
-        } else if (type == 'M') {
-          uint8_t m = localMsg[1];
-          if (m > 8) m = 8;
-          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-          sysState.knob0Rotation = m;
-          xSemaphoreGive(sysState.mutex);
-          __atomic_store_n(&waveSel, m, __ATOMIC_RELAXED);
-        } else if (type == 'J') {
-          uint8_t jm = localMsg[1] & 0x01;
-          __atomic_store_n(&joyMode, jm, __ATOMIC_RELAXED);
-        } else if (type == 'O') {
-          int8_t os = (int8_t)localMsg[1] - 3;
-          if (os < -3) os = -3;
-          if (os > 3) os = 3;
-          __atomic_store_n(&octaveShift, os, __ATOMIC_RELAXED);
-        }
+        recordCanEvent(localMsg, RECORD_FROM_RX);
+        handleCommandMessage(localMsg);
     }
 }
 
 void setup() {
   // put your setup code here, to run once:
   sysState.mutex = xSemaphoreCreateMutex();
+  recordMutex = xSemaphoreCreateMutex();
   msgInQ = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(36, 8);
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
-  sysState.knob3Rotation = 8;   // 默认最大音量
+  __atomic_store_n(&knob3Rotation, 7, __ATOMIC_RELAXED);   // 默认最大音量
+  __atomic_store_n(&knob0Rotation, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&knob1Rotation, 4, __ATOMIC_RELAXED);
+  __atomic_store_n(&knob2Rotation, 0, __ATOMIC_RELAXED);
   initSineTable();
 
   //Set pin directions
@@ -981,10 +1157,10 @@ void setup() {
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
 
-  sysState.knob3Rotation = 8;  // volume 默认最大（你原来）
-  sysState.knob0Rotation = 0;  // wave 默认 saw
-  sysState.knob1Rotation = 4;  // duty 默认中间
-  sysState.knob2Rotation = 0;  // tone 默认最亮/不过滤
+  __atomic_store_n(&knob3Rotation, 7, __ATOMIC_RELAXED);  // volume 默认最大（你原来）
+  __atomic_store_n(&knob0Rotation, 0, __ATOMIC_RELAXED);  // wave 默认 saw
+  __atomic_store_n(&knob1Rotation, 4, __ATOMIC_RELAXED);  // duty 默认中间
+  __atomic_store_n(&knob2Rotation, 0, __ATOMIC_RELAXED);  // tone 默认最亮/不过滤
 
 
   vTaskStartScheduler();
